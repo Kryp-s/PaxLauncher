@@ -217,22 +217,44 @@ final class Updater {
                     .header("Accept", "application/vnd.github+json").header("User-Agent", "PaxLauncher/" + VERSION)
                     .timeout(Duration.ofSeconds(12)).build();
             HttpResponse<String> resp = client().send(rq, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            if (resp.statusCode() != 200) return null;
+            if (resp.statusCode() != 200) { log("GitHub API: HTTP " + resp.statusCode()); return null; }
             Object j = Json.parse(resp.body());
             String tag = Json.string(Json.get(j, "tag_name"));
-            if (tag == null) return null;
+            if (tag == null) { log("у відповіді немає tag_name"); return null; }
             String v = tag.startsWith("v") || tag.startsWith("V") ? tag.substring(1) : tag;
-            if (cmp(v, VERSION) <= 0) return null;
+            if (cmp(v, VERSION) <= 0) { log("оновлень немає: встановлено " + VERSION + ", на GitHub " + v); return null; }
+            Release best = null;
             for (Object a : Json.list(Json.get(j, "assets"))) {
                 String name = Json.string(Json.get(a, "name"));
                 String url = Json.string(Json.get(a, "browser_download_url"));
-                if (name == null || url == null || !name.toLowerCase().endsWith(".msi")) continue;
+                if (name == null || url == null) continue;
+                String low = name.toLowerCase();
+                boolean msi = low.endsWith(".msi");
+                boolean exe = low.endsWith(".exe") && !low.contains("portable");
+                if (!msi && !exe) continue;
                 String dg = Json.string(Json.get(a, "digest"));
                 String sha = dg != null && dg.startsWith("sha256:") ? dg.substring(7) : null;
-                return new Release(v, url, name, sha);
+                Release r = new Release(v, url, name, sha);
+                if (msi) return r;          // MSI в пріоритеті
+                if (best == null) best = r; // інакше перший інсталятор .exe (Inno Setup)
             }
-        } catch (Exception ignored) { }
+            if (best == null) log("у релізі " + tag + " немає інсталятора (.msi або .exe)");
+            else log("знайдено оновлення " + v + ": " + best.file());
+            return best;
+        } catch (Throwable e) {
+            log("check: " + e);
+        }
         return null;
+    }
+
+    /** Журнал оновлень: ~/paxlauncher/update.log (щоб було видно, чому оновлення не знайшлося). */
+    static void log(String s) {
+        try {
+            Files.createDirectories(PaxLauncher.ROOT);
+            Files.writeString(PaxLauncher.ROOT.resolve("update.log"),
+                    java.time.LocalDateTime.now() + " " + s + "\n", StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (Exception ignored) { }
     }
 
     static int cmp(String a, String b) {
@@ -257,10 +279,17 @@ final class Updater {
                     Thread t = new Thread(() -> {
                         try {
                             Path f = download(r);
-                            // тихе встановлення поверх старої версії (MSI з тим самим upgrade-uuid)
-                            new ProcessBuilder("msiexec", "/i", f.toString(), "/passive", "/norestart").start();
+                            // тихе встановлення поверх старої версії (MSI з тим самим upgrade-uuid або Inno Setup з тим самим AppId)
+                            if (r.file().toLowerCase().endsWith(".msi")) {
+                                new ProcessBuilder("msiexec", "/i", f.toString(), "/passive", "/norestart").start();
+                            } else {
+                                // Inno Setup; через "cmd /c start" Windows сам покаже UAC, якщо потрібні права адміна
+                                new ProcessBuilder("cmd", "/c", "start", "", f.toString(),
+                                        "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART").start();
+                            }
                             System.exit(0);
                         } catch (Exception e) {
+                            log("install: " + e);
                             SwingUtilities.invokeLater(d::dispose); // не вдалося — просто працюємо далі зі старою версією
                         }
                     }, "update-install");
