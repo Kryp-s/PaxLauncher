@@ -13,31 +13,29 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - name: WiX (потрібен для .exe/.msi)
-        shell: pwsh
-        run: |
-          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) { choco install wixtoolset --no-progress -y }
-          $wix = Get-ChildItem "C:\Program Files (x86)" -Filter "WiX Toolset*" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($wix) { "$($wix.FullName)\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH }
-      - name: Build
+      - name: Build app
         shell: bash
         run: |
           VER="${GITHUB_REF_NAME#v}"
+          echo "PAX_VERSION=$VER" >> "$GITHUB_ENV"
           sed -i "s/static final String VERSION = \".*\";/static final String VERSION = \"$VER\";/" PaxLauncher.java
           mkdir -p build input dist zipdir
           javac -encoding UTF-8 -d build PaxLauncher.java
           jar cfe input/PaxLauncher.jar PaxLauncher -C build .
           MODS=java.desktop,java.net.http,java.management,java.logging,jdk.crypto.ec
-          COMMON=(--name PaxLauncher --app-version "$VER" --vendor "PaxLauncher"
-            --description "Ukrainian Minecraft launcher" --copyright "PaxLauncher"
-            --input input --main-jar PaxLauncher.jar --main-class PaxLauncher
-            --icon icon.ico --add-modules "$MODS")
-          INSTALLER=(--about-url "https://github.com/Kryp-s/PaxLauncher" --license-file LICENSE)
-          WINOPTS=(--win-menu --win-menu-group PaxLauncher --win-shortcut --win-shortcut-prompt --win-per-user-install)
-          jpackage --type msi "${COMMON[@]}" "${INSTALLER[@]}" "${WINOPTS[@]}" --win-upgrade-uuid dd69ccc0-b755-42d8-8b9f-97b0aafbfd3d --dest dist
-          jpackage --type exe "${COMMON[@]}" "${INSTALLER[@]}" "${WINOPTS[@]}" --win-dir-chooser --win-upgrade-uuid dd69ccc0-b755-42d8-8b9f-97b0aafbfd3d --dest dist
-          jpackage --type app-image "${COMMON[@]}" --dest zipdir
-          cd zipdir && 7z a ../dist/PaxLauncher-$VER-portable.zip PaxLauncher
+          jpackage --type app-image --name PaxLauncher --app-version "$VER" --vendor "Kryp-s" \
+            --description "Ukrainian Minecraft launcher" --copyright "Kryp-s" \
+            --input input --main-jar PaxLauncher.jar --main-class PaxLauncher \
+            --icon icon.ico --add-modules "$MODS" --dest zipdir
+          (cd zipdir && 7z a "../dist/PaxLauncher-$VER-portable.zip" PaxLauncher)
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $t = Get-Content installer.iss -Raw -Encoding UTF8
+          [IO.File]::WriteAllText("$PWD\installer-bom.iss", $t, (New-Object System.Text.UTF8Encoding $true))
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer-bom.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
