@@ -226,7 +226,8 @@ final class Updater {
             for (Object a : Json.list(Json.get(j, "assets"))) {
                 String name = Json.string(Json.get(a, "name"));
                 String url = Json.string(Json.get(a, "browser_download_url"));
-                if (name == null || url == null || !name.toLowerCase().endsWith(".msi")) continue;
+                String ln = name == null ? "" : name.toLowerCase();
+                if (name == null || url == null || !ln.endsWith(".exe") || !ln.contains("setup")) continue;
                 String dg = Json.string(Json.get(a, "digest"));
                 String sha = dg != null && dg.startsWith("sha256:") ? dg.substring(7) : null;
                 return new Release(v, url, name, sha);
@@ -257,8 +258,8 @@ final class Updater {
                     Thread t = new Thread(() -> {
                         try {
                             Path f = download(r);
-                            // тихе встановлення поверх старої версії (MSI з тим самим upgrade-uuid)
-                            new ProcessBuilder("msiexec", "/i", f.toString(), "/passive", "/norestart").start();
+                            // встановлення поверх старої версії: інсталятор сам закриє лаунчер, оновить файли й відкриє його знову
+                            new ProcessBuilder(f.toString(), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS").start();
                             System.exit(0);
                         } catch (Exception e) {
                             SwingUtilities.invokeLater(d::dispose); // не вдалося — просто працюємо далі зі старою версією
