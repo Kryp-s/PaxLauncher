@@ -30,12 +30,12 @@ jobs:
           MODS=java.desktop,java.net.http,java.management,java.logging,jdk.crypto.ec
           COMMON=(--name PaxLauncher --app-version "$VER" --vendor "PaxLauncher"
             --description "Ukrainian Minecraft launcher" --copyright "PaxLauncher"
-            --about-url "https://github.com/Kryp-s/PaxLauncher" --license-file LICENSE
             --input input --main-jar PaxLauncher.jar --main-class PaxLauncher
             --icon icon.ico --add-modules "$MODS")
+          INSTALLER=(--about-url "https://github.com/Kryp-s/PaxLauncher" --license-file LICENSE)
           WINOPTS=(--win-menu --win-menu-group PaxLauncher --win-shortcut --win-shortcut-prompt --win-per-user-install)
-          jpackage --type msi "${COMMON[@]}" "${WINOPTS[@]}" --win-upgrade-uuid dd69ccc0-b755-42d8-8b9f-97b0aafbfd3d --dest dist
-          jpackage --type exe "${COMMON[@]}" "${WINOPTS[@]}" --win-dir-chooser --win-upgrade-uuid dd69ccc0-b755-42d8-8b9f-97b0aafbfd3d --dest dist
+          jpackage --type msi "${COMMON[@]}" "${INSTALLER[@]}" "${WINOPTS[@]}" --win-upgrade-uuid dd69ccc0-b755-42d8-8b9f-97b0aafbfd3d --dest dist
+          jpackage --type exe "${COMMON[@]}" "${INSTALLER[@]}" "${WINOPTS[@]}" --win-dir-chooser --win-upgrade-uuid dd69ccc0-b755-42d8-8b9f-97b0aafbfd3d --dest dist
           jpackage --type app-image "${COMMON[@]}" --dest zipdir
           cd zipdir && 7z a ../dist/PaxLauncher-$VER-portable.zip PaxLauncher
       - uses: softprops/action-gh-release@v2
