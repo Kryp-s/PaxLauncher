@@ -183,7 +183,9 @@ final class Updater {
 
     /** Викликається після показу вікна. Вимкнути: autoupdate=false у launcher.properties. */
     static void start(LauncherWindow win, Settings cfg) {
-        if (!cfg.getb("autoupdate", true) || !installedBuild()) return;
+        if (!cfg.getb("autoupdate", true)) { log("автооновлення вимкнено (autoupdate=false у launcher.properties)"); return; }
+        if (!installedBuild()) return;
+        log("перевірка оновлень, встановлена версія " + VERSION);
         Thread t = new Thread(() -> {
             Release r = check();
             if (r != null) SwingUtilities.invokeLater(() -> apply(win, r));
@@ -195,13 +197,16 @@ final class Updater {
     /** Оновлюємось лише коли запущено встановлену програму (jar з jpackage на Windows), а не «java PaxLauncher.java». */
     static boolean installedBuild() {
         try {
-            if (!Engine.osName().equals("windows")) return false;
+            if (!Engine.osName().equals("windows")) { log("пропуск: автооновлення працює лише у Windows"); return false; }
             var cs = PaxLauncher.class.getProtectionDomain().getCodeSource();
-            if (cs == null || cs.getLocation() == null) return false;
+            if (cs == null || cs.getLocation() == null) { log("пропуск: невідомий шлях запуску"); return false; }
             Path loc = Path.of(cs.getLocation().toURI());
             String n = loc.getFileName().toString();
-            return n.endsWith(".jar") && !n.equals("PaxLauncher-lean.jar");
+            boolean ok = n.endsWith(".jar") && !n.equals("PaxLauncher-lean.jar");
+            if (!ok) log("пропуск: це не встановлена збірка (запуск з " + loc + ")");
+            return ok;
         } catch (Exception e) {
+            log("installedBuild: " + e);
             return false;
         }
     }
@@ -251,7 +256,9 @@ final class Updater {
     static void log(String s) {
         try {
             Files.createDirectories(PaxLauncher.ROOT);
-            Files.writeString(PaxLauncher.ROOT.resolve("update.log"),
+            Path lf = PaxLauncher.ROOT.resolve("update.log");
+            if (Files.exists(lf) && Files.size(lf) > 100_000) Files.delete(lf); // журнал не росте безмежно
+            Files.writeString(lf,
                     java.time.LocalDateTime.now() + " " + s + "\n", StandardCharsets.UTF_8,
                     StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         } catch (Exception ignored) { }
@@ -271,31 +278,78 @@ final class Updater {
         try { return d.isEmpty() ? 0 : Integer.parseInt(d); } catch (NumberFormatException e) { return 0; }
     }
 
-    /** Показує повідомлення, у фоні завантажує встановлювач, запускає його й закриває запускач. */
+    /** Скільки секунд показувати вікно «Знайдено оновлення», перш ніж почати встановлення. */
+    static final int COUNTDOWN = 7;
+
+    private static String countdownText(Release r, int sec) {
+        return I18n.t("Знайдено нову версію ") + r.version()
+                + I18n.t(". Запускач закриється через ") + sec + I18n.t(" с і встановить оновлення.");
+    }
+
+    /** Вікно з відліком: через COUNTDOWN секунд (або одразу по «Оновити зараз») починається встановлення. */
     static void apply(LauncherWindow win, Release r) {
+        int[] left = {COUNTDOWN};
+        boolean[] auto = {false};
+        JLabel msg = Dlg.text(countdownText(r, left[0]));
+        boolean now = Dlg.show(win, I18n.t("Оновлення"), msg, I18n.t("Оновити зараз"), I18n.t("Пізніше"), d -> {
+            javax.swing.Timer tm = new javax.swing.Timer(1000, null);
+            tm.addActionListener(e -> {
+                if (!d.isDisplayable()) { tm.stop(); return; }   // користувач закрив вікно
+                if (--left[0] <= 0) { tm.stop(); auto[0] = true; d.dispose(); }
+                else msg.setText(Dlg.text(countdownText(r, left[0])).getText());
+            });
+            tm.start();
+        });
+        if (!now && !auto[0]) { log("користувач відклав оновлення " + r.version()); return; }
+        install(win, r);
+    }
+
+    /** У фоні завантажує встановлювач, запускає його й закриває запускач. */
+    private static void install(LauncherWindow win, Release r) {
         Dlg.show(win, I18n.t("Оновлення"),
-                Dlg.text(I18n.t("Знайдено нову версію ") + r.version() + I18n.t(". Завантажую й встановлюю — запускач перезапуститься сам.")),
+                Dlg.text(I18n.t("Завантажую оновлення ") + r.version() + I18n.t("… Запускач закриється й встановить його сам.")),
                 I18n.t("Гаразд"), null, d -> {
                     Thread t = new Thread(() -> {
                         try {
                             Path f = download(r);
-                            // тихе встановлення поверх старої версії (MSI з тим самим upgrade-uuid або Inno Setup з тим самим AppId)
-                            if (r.file().toLowerCase().endsWith(".msi")) {
-                                new ProcessBuilder("msiexec", "/i", f.toString(), "/passive", "/norestart").start();
-                            } else {
-                                // Inno Setup; через "cmd /c start" Windows сам покаже UAC, якщо потрібні права адміна
-                                new ProcessBuilder("cmd", "/c", "start", "", f.toString(),
-                                        "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART").start();
-                            }
+                            log("завантажено " + f);
+                            runInstaller(f);
+                            log("встановлювач запущено, запускач закривається");
                             System.exit(0);
                         } catch (Exception e) {
                             log("install: " + e);
-                            SwingUtilities.invokeLater(d::dispose); // не вдалося — просто працюємо далі зі старою версією
+                            SwingUtilities.invokeLater(() -> {
+                                d.dispose();
+                                Dlg.show(win, I18n.t("Оновлення"),
+                                        Dlg.text(I18n.t("Не вдалося встановити оновлення. Подробиці — у файлі update.log (папка paxlauncher).")),
+                                        I18n.t("Гаразд"), null);
+                            });
                         }
                     }, "update-install");
                     t.setDaemon(false);
                     t.start();
                 });
+    }
+
+    /** Тихе встановлення поверх старої версії: MSI (той самий upgrade-uuid) або Inno Setup (той самий AppId). */
+    static void runInstaller(Path f) throws IOException {
+        if (f.getFileName().toString().toLowerCase().endsWith(".msi")) {
+            new ProcessBuilder("msiexec", "/i", f.toString(), "/passive", "/norestart").start();
+            return;
+        }
+        String[] flags = {"/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"};
+        List<String> cmd = new ArrayList<>();
+        cmd.add(f.toString());
+        cmd.addAll(Arrays.asList(flags));
+        try {
+            new ProcessBuilder(cmd).start();
+        } catch (IOException e) {
+            // «потрібне підвищення прав» (error=740): запускаємо через shell, щоб Windows показала UAC
+            log("прямий запуск не вдався (" + e.getMessage() + "), пробую через cmd start");
+            List<String> viaShell = new ArrayList<>(List.of("cmd", "/c", "start", ""));
+            viaShell.addAll(cmd);
+            new ProcessBuilder(viaShell).start();
+        }
     }
 
     static Path download(Release r) throws Exception {
