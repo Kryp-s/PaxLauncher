@@ -18,9 +18,9 @@ jobs:
         run: |
           VER="${GITHUB_REF_NAME#v}"
           echo "PAX_VERSION=$VER" >> "$GITHUB_ENV"
-          sed -i "s/static final String VERSION = \".*\";/static final String VERSION = \"$VER\";/" PaxLauncher.java
+          sed -i "s/static final String VERSION = \".*\";/static final String VERSION = \"$VER\";/" Updater.java
           mkdir -p build input dist zipdir
-          javac -encoding UTF-8 -d build PaxLauncher.java
+          javac -encoding UTF-8 -d build *.java
           jar cfe input/PaxLauncher.jar PaxLauncher -C build .
           MODS=java.desktop,java.net.http,java.management,java.logging,jdk.crypto.ec
           jpackage --type app-image --name PaxLauncher --app-version "$VER" --vendor "Kryp-s" \
