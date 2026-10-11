@@ -60,7 +60,9 @@ final class NavBtn extends JButton {
     @Override protected void paintComponent(Graphics g0) {
         Graphics2D g = (Graphics2D) g0.create();
         Theme.aa(g);
-        int w = getWidth(), h = getHeight(), s = 46;
+        double k = Theme.S;
+        g.scale(k, k);
+        int w = (int) Math.round(getWidth() / k), h = (int) Math.round(getHeight() / k), s = 46;
         float hv = fx.h(), sl = fx.s(), pr = fx.p();
         Fx.squeeze(g, w, h, pr);
         if (hv > 0 && sl < 1) {

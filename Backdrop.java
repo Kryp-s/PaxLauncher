@@ -32,9 +32,12 @@ import javax.swing.plaf.basic.*;
 
 final class Backdrop extends JPanel {
     int arc = 10;
+    boolean frozen;
     boolean side = true;
 
     Backdrop(LayoutManager lm) { super(lm); setOpaque(true); setBackground(Theme.BG2); }
+
+    @Override public void doLayout() { if (!frozen) super.doLayout(); }
 
     @Override protected void paintComponent(Graphics g0) {
         Graphics2D g = (Graphics2D) g0.create();

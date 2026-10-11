@@ -72,7 +72,7 @@ final class LauncherWindow extends JFrame {
     boolean lFilling;
 
     final Combo<JavaFinder.Inst> javaC = new Combo<>();
-    final JavaFinder.Inst javaBuiltin = new JavaFinder.Inst(I18n.t("Вбудована (Java ") + Runtime.version().feature() + ")", "");
+    final JavaFinder.Inst javaAuto = new JavaFinder.Inst(I18n.t("Автоматично (під версію гри)"), "");
     final JavaFinder.Inst javaCustom = new JavaFinder.Inst(I18n.t("Свій шлях…"), null);
     boolean javaSync;
     final Field javaF = new Field(""), jvmF = new Field(""), wF = new Field(""), hF = new Field(""), dirF = new Field("");
@@ -191,7 +191,7 @@ final class LauncherWindow extends JFrame {
         setIconImage(Theme.icon(64));
         setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
         setUndecorated(true);
-        Round.apply(this, () -> maxed ? 0 : 10);
+        shapeUpd = Round.apply(this, () -> animating && plainAnim ? -1 : maxed ? 0 : 10);
         setSize(1240, 780);
         setMinimumSize(new Dimension(1000, 660));
         setLocationRelativeTo(null);
@@ -221,6 +221,7 @@ final class LauncherWindow extends JFrame {
         bg.add(rootPanel, BorderLayout.CENTER);
 
         loadSettings();
+        online.start();
         rpc.configure(discC.isSelected() ? discF.getText().trim() : "");
         presenceIdle();
         showPage("play");
@@ -294,24 +295,292 @@ final class LauncherWindow extends JFrame {
     int hpos = -1;
     boolean navigating;
     final Check discC = new Check(I18n.t("Показувати гру в Discord"), true);
+    final Check onlineC = new Check(I18n.t("Враховувати мене в лічильнику онлайну"), true);
+    final OnlineBadge onlineBadge = new OnlineBadge();
+    final Online online = new Online(cfg, () -> onlineC.isSelected(), onlineBadge::set);
     final JLabel playerLbl = label("—", 15, true, Theme.TEXT);
 
+    private javax.swing.Timer maxAnim;
+    private boolean animating;
+    private Boolean translucent;
+    private Runnable shapeUpd;
+    private static final int[] BASE_SIZE = {1240, 780};
+    private static final double MAX_MS = 240e6;
+    // true  = прозоре вікно на весь екран + прямокутник усередині (інколи дає привиди на стиках);
+    // false = вікно змінює розмір напряму, без перемикання прозорості.
+    private static final boolean LAYERED_ANIM = false;
+
+    private static double ease(double t) { return 1 - Math.pow(1 - t, 3); }
+
+    private java.awt.image.BufferedImage snap(JComponent c, int w, int h, double sx, double sy) {
+        java.awt.image.BufferedImage img = new java.awt.image.BufferedImage(
+                Math.max(1, (int) Math.ceil(w * sx)), Math.max(1, (int) Math.ceil(h * sy)), java.awt.image.BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = img.createGraphics();
+        g.scale(sx, sy);
+        c.paint(g);
+        g.dispose();
+        return img;
+    }
+
+    private final class Veil extends JComponent {
+        final java.awt.image.BufferedImage oldImg;
+        volatile java.awt.image.BufferedImage newImg;
+        volatile boolean painted;
+        boolean layered;
+        double k;
+        int arc;
+        final Rectangle r = new Rectangle();
+
+        Veil(java.awt.image.BufferedImage o, java.awt.image.BufferedImage n, boolean layered) {
+            oldImg = o;
+            newImg = n;
+            this.layered = layered;
+        }
+
+        @Override public boolean isOpaque() { return !layered; }
+
+        private static double step(double q) {
+            q = Math.max(0, Math.min(1, q));
+            return q * q * (3 - 2 * q);
+        }
+
+        @Override protected void paintComponent(Graphics g0) {
+            Graphics2D g = (Graphics2D) g0.create();
+            if (layered) {
+                g.setComposite(AlphaComposite.Clear);
+                g.fillRect(0, 0, getWidth(), getHeight());
+                g.setComposite(AlphaComposite.SrcOver);
+                if (arc > 0) g.clip(new java.awt.geom.RoundRectangle2D.Float(r.x, r.y, r.width, r.height, arc * 2f, arc * 2f));
+                else g.clipRect(r.x, r.y, r.width, r.height);
+            } else r.setBounds(0, 0, getWidth(), getHeight());
+            g.clipRect(r.x, r.y, r.width, r.height);
+            // Обидва знімки завжди розтягуються на поточний прямокутник вікна, тож жодного «меншого вікна»
+            // в куті не буває. Найближчий сусід у ~8 разів швидший за білінійну інтерполяцію.
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+            double b = k >= 1 ? 1 : step((k - 0.2) / 0.55);
+            if (b < 1) g.drawImage(oldImg, r.x, r.y, r.width, r.height, null);
+            if (b > 0 && newImg != null) {
+                if (b < 1) g.setComposite(AlphaComposite.SrcOver.derive((float) b));
+                g.drawImage(newImg, r.x, r.y, r.width, r.height, null);
+            }
+            g.dispose();
+            painted = true;
+        }
+    }
+
+    private boolean plainAnim;
+    private JWindow overlay;
+
+    private boolean overlayOk() {
+        try {
+            return getGraphicsConfiguration().getDevice().isWindowTranslucencySupported(GraphicsDevice.WindowTranslucency.PERPIXEL_TRANSLUCENT);
+        } catch (RuntimeException e) { return false; }
+    }
+
+    // Анімацію веде окреме прозоре вікно-накладка: головне вікно ніколи не перемикає прозорість
+    // і не змінює розмір на кожному кадрі, тому немає ні привидів, ні смикання.
     void toggleMax() {
-        if (!maxed) {
-            restoreBounds = getBounds();
+        if (animating) return;
+        if (!overlayOk()) { toggleMaxPlain(); return; }
+        animating = true;
+        final boolean expand = !maxed;
+        final Rectangle from = getBounds();
+        final Rectangle to;
+        if (expand) {
+            restoreBounds = from;
             GraphicsConfiguration gc = getGraphicsConfiguration();
             Rectangle sb = gc.getBounds();
             Insets in = Toolkit.getDefaultToolkit().getScreenInsets(gc);
-            maxed = true;
-            setBounds(sb.x + in.left, sb.y + in.top, sb.width - in.left - in.right, sb.height - in.top - in.bottom);
+            to = new Rectangle(sb.x + in.left, sb.y + in.top, sb.width - in.left - in.right, sb.height - in.top - in.bottom);
         } else {
-            maxed = false;
-            if (restoreBounds != null) setBounds(restoreBounds);
+            to = restoreBounds != null ? new Rectangle(restoreBounds) : new Rectangle(from.x, from.y, BASE_SIZE[0], BASE_SIZE[1]);
         }
+        java.awt.geom.AffineTransform dt = getGraphicsConfiguration().getDefaultTransform();
+        final double sx = dt.getScaleX(), sy = dt.getScaleY();
+        final Rectangle area = from.union(to);
+        final int arcFrom = expand ? 10 : 0, arcTo = expand ? 0 : 10;
+
+        // крок A: накладка з поточним кадром точно поверх вікна
+        final Veil veil = new Veil(snap(bg, bg.getWidth(), bg.getHeight(), sx, sy), null, true);
+        veil.arc = arcFrom;
+        veil.r.setBounds(from.x - area.x, from.y - area.y, from.width, from.height);
+        if (overlay == null) {
+            overlay = new JWindow(this);
+            overlay.setFocusableWindowState(false);
+            overlay.setBackground(new Color(0, 0, 0, 0));
+        }
+        overlay.setContentPane(veil);
+        overlay.setBounds(area);
+        overlay.setVisible(true);
+
+        // крок B: коли накладка вже намальована, перебудовуємо інтерфейс під головним вікном
+        final int[] cnt = {0, 0};
+        final javax.swing.Timer wait = new javax.swing.Timer(8, null);
+        wait.addActionListener(ev -> {
+            cnt[0]++;
+            if (veil.painted) cnt[1]++;
+            if (cnt[1] < 3 && cnt[0] <= 40) return;
+            wait.stop();
+
+            maxed = expand;
+            bg.arc = maxed ? 0 : 10;
+            for (Btn b : maxBtns) b.setGlyph(maxed ? 4 : 3);
+            double old = Theme.S, ns = expand ? UiScale.pick(to.width, to.height) : 1.0;
+            if (Math.abs(old - ns) >= 0.001) {
+                Theme.setScale(ns);
+                UiScale.apply(getContentPane(), old, ns);
+            }
+            bg.frozen = false;
+            bg.setSize(to.width, to.height);
+            bg.validate();
+            veil.newImg = snap(bg, to.width, to.height, sx, sy);
+            bg.frozen = true;
+            bg.setVisible(false);
+            // головне вікно ховається під накладкою: лишається меншим із двох розмірів
+            if (!expand) setBounds(to);
+
+            final long t0 = System.nanoTime();
+            maxAnim = new javax.swing.Timer(4, null);
+            maxAnim.addActionListener(e -> {
+                double t = Math.min(1.0, (System.nanoTime() - t0) / MAX_MS), k = ease(t);
+                veil.k = k;
+                if (t >= 1.0) {
+                    maxAnim.stop();
+                    maxAnim = null;
+                    veil.k = 1;
+                    veil.arc = arcTo;
+                    veil.r.setBounds(to.x - area.x, to.y - area.y, to.width, to.height);
+                    veil.paintImmediately(0, 0, veil.getWidth(), veil.getHeight());
+                    if (expand) setBounds(to);
+                    bg.frozen = false;
+                    bg.setVisible(true);
+                    bg.validate();
+                    final javax.swing.Timer fin = new javax.swing.Timer(90, e2 -> {
+                        overlay.setVisible(false);
+                        animating = false;
+                        bg.repaint();
+                    });
+                    fin.setRepeats(false);
+                    fin.start();
+                    return;
+                }
+                int x = from.x + (int) Math.round((to.x - from.x) * k), y = from.y + (int) Math.round((to.y - from.y) * k);
+                int w = from.width + (int) Math.round((to.width - from.width) * k), h = from.height + (int) Math.round((to.height - from.height) * k);
+                veil.r.setBounds(x - area.x, y - area.y, w, h);
+                veil.arc = (int) Math.round(arcFrom + (arcTo - arcFrom) * k);
+                veil.paintImmediately(0, 0, veil.getWidth(), veil.getHeight());
+            });
+            maxAnim.start();
+        });
+        wait.start();
+    }
+
+    void toggleMaxPlain() {
+        if (animating) return;
+        plainAnim = true;
+        final boolean expand = !maxed;
+        final Rectangle from = getBounds();
+        final Rectangle to;
+        if (expand) {
+            restoreBounds = from;
+            GraphicsConfiguration gc = getGraphicsConfiguration();
+            Rectangle sb = gc.getBounds();
+            Insets in = Toolkit.getDefaultToolkit().getScreenInsets(gc);
+            to = new Rectangle(sb.x + in.left, sb.y + in.top, sb.width - in.left - in.right, sb.height - in.top - in.bottom);
+        } else {
+            to = restoreBounds != null ? new Rectangle(restoreBounds) : new Rectangle(from.x, from.y, BASE_SIZE[0], BASE_SIZE[1]);
+        }
+
+        java.awt.geom.AffineTransform dt = getGraphicsConfiguration().getDefaultTransform();
+        final double sx = dt.getScaleX(), sy = dt.getScaleY();
+        final java.awt.image.BufferedImage oldImg = snap(bg, bg.getWidth(), bg.getHeight(), sx, sy);
+
+        animating = true;
+        try { setShape(null); } catch (RuntimeException ignored) { }
+        maxed = expand;
         bg.arc = maxed ? 0 : 10;
         for (Btn b : maxBtns) b.setGlyph(maxed ? 4 : 3);
-        revalidate();
-        repaint();
+
+        double old = Theme.S, ns = expand ? UiScale.pick(to.width, to.height) : 1.0;
+        if (Math.abs(old - ns) >= 0.001) {
+            Theme.setScale(ns);
+            UiScale.apply(getContentPane(), old, ns);
+        }
+        bg.frozen = false;
+        bg.setSize(to.width, to.height);
+        bg.validate();
+        final java.awt.image.BufferedImage newImg = snap(bg, to.width, to.height, sx, sy);
+        bg.frozen = true;
+
+        boolean lay = false;
+        if (LAYERED_ANIM && (translucent == null || translucent)) {
+            try {
+                if (getGraphicsConfiguration().getDevice().isWindowTranslucencySupported(GraphicsDevice.WindowTranslucency.PERPIXEL_TRANSLUCENT)) {
+                    setBackground(new Color(0, 0, 0, 0));
+                    lay = true;
+                }
+            } catch (RuntimeException ignored) { }
+            translucent = lay;
+        }
+        final boolean layered = lay;
+        final Rectangle area = layered ? from.union(to) : null;
+
+        final Component oldGlass = getGlassPane();
+        final Veil veil = new Veil(oldImg, newImg, layered);
+        veil.arc = expand ? 10 : 0;
+        if (layered) veil.r.setBounds(from.x - area.x, from.y - area.y, from.width, from.height);
+        setGlassPane(veil);
+        veil.setVisible(true);
+        bg.setVisible(false);
+        if (layered) setBounds(area);
+
+        final int arcFrom = expand ? 10 : 0, arcTo = expand ? 0 : 10;
+        final long t0 = System.nanoTime();
+        maxAnim = new javax.swing.Timer(4, null);
+        maxAnim.addActionListener(e -> {
+            double t = Math.min(1.0, (System.nanoTime() - t0) / MAX_MS), k = ease(t);
+            veil.k = k;
+            int x = from.x + (int) Math.round((to.x - from.x) * k), y = from.y + (int) Math.round((to.y - from.y) * k);
+            int w = from.width + (int) Math.round((to.width - from.width) * k), h = from.height + (int) Math.round((to.height - from.height) * k);
+            if (t >= 1.0) {
+                maxAnim.stop();
+                veil.k = 1;
+                veil.arc = arcTo;
+                setBounds(to);
+                if (layered) {
+                    // спершу малюємо фінальний кадр ще у прозорому вікні нового розміру,
+                    // і лише потім робимо вікно непрозорим: так не буває порожнього кадру
+                    veil.r.setBounds(0, 0, to.width, to.height);
+                    veil.paintImmediately(0, 0, to.width, to.height);
+                    veil.layered = false;
+                    setBackground(Theme.BG2);
+                }
+                bg.frozen = false;
+                bg.setVisible(true);
+                bg.validate();
+                veil.paintImmediately(0, 0, to.width, to.height);
+                SwingUtilities.invokeLater(() -> SwingUtilities.invokeLater(() -> {
+                    setGlassPane(oldGlass);
+                    oldGlass.setVisible(false);
+                    animating = false;
+                    plainAnim = false;
+                    shapeUpd.run();
+                    bg.repaint();
+                    for (java.awt.event.ActionListener al : maxAnim.getActionListeners()) maxAnim.removeActionListener(al);
+                    maxAnim = null;
+                }));
+                return;
+            }
+            if (layered) {
+                veil.r.setBounds(x - area.x, y - area.y, w, h);
+                veil.arc = (int) Math.round(arcFrom + (arcTo - arcFrom) * k);
+            } else {
+                setBounds(x, y, w, h);
+                validate();
+            }
+            veil.paintImmediately(0, 0, veil.getWidth(), veil.getHeight());
+        });
+        maxAnim.start();
     }
 
     volatile boolean inGame;
@@ -385,6 +654,12 @@ final class LauncherWindow extends JFrame {
 
     void exit() {
         try { saveSettings(); } catch (Throwable ignored) { }
+        try {
+            Thread bt = new Thread(online::bye, "online-bye");
+            bt.setDaemon(true);
+            bt.start();
+            bt.join(800);
+        } catch (Throwable ignored) { }
         try { dispose(); } catch (Throwable ignored) { }
         Thread w = new Thread(() -> {
             try { Thread.sleep(2500); } catch (InterruptedException ignored) { }
@@ -621,6 +896,7 @@ final class LauncherWindow extends JFrame {
 
         rp.row(header(I18n.t("Новини Minecraft")), 26);
         rp.row(new NewsPanel(), 12);
+        if (Online.configured()) rp.row(onlineBadge, 4);
         rp.end();
 
         JScrollPane sp = vscroll(rp, Theme.SIDE);
@@ -777,6 +1053,8 @@ final class LauncherWindow extends JFrame {
     }
 
     void buildThemeControls() {
+        final double sc = Theme.S;
+        Theme.S = 1.0;
         themeModeP.setOpaque(false);
         themeColorP.setOpaque(false);
         themeModeP.removeAll();
@@ -794,6 +1072,11 @@ final class LauncherWindow extends JFrame {
         Btn custom = small(new Btn(I18n.t("Свій колір…"), Btn.Kind.SECONDARY));
         custom.addActionListener(e -> pickColor());
         themeColorP.add(custom);
+        Theme.S = sc;
+        if (Math.abs(sc - 1.0) > 0.001) {
+            for (Component c : themeModeP.getComponents()) UiScale.apply(c, 1.0, sc);
+            for (Component c : themeColorP.getComponents()) UiScale.apply(c, 1.0, sc);
+        }
         themeModeP.revalidate();
         themeModeP.repaint();
         themeColorP.revalidate();
@@ -892,12 +1175,13 @@ final class LauncherWindow extends JFrame {
             if (jRes != null && jRes.length > 0) javaF.setText(jRes[0].getAbsolutePath());
         });
         javaC.setPreferredSize(new Dimension(300, 40));
-        javaF.setToolTipText(I18n.t("Шлях до java (або до папки JDK). Порожньо — вбудована Java запускача."));
+        javaC.wideList = true;
+        javaF.setToolTipText(I18n.t("Шлях до java (або до папки JDK). Порожньо — автоматичний вибір Java під версію гри."));
         JPanel javaP = new JPanel(new BorderLayout(10, 0));
         javaP.setOpaque(false);
         javaP.add(javaC, BorderLayout.WEST);
         javaP.add(javaF, BorderLayout.CENTER);
-        javaC.addItem(javaBuiltin);
+        javaC.addItem(javaAuto);
         javaC.addItem(javaCustom);
         javaC.addActionListener(e -> {
             if (javaSync) return;
@@ -957,6 +1241,12 @@ final class LauncherWindow extends JFrame {
         discC.setBorder(new EmptyBorder(0, 24, 0, 0));
         hideP.add(discC);
         row(c, 8, I18n.t("Поведінка"), hideP, null);
+        if (Online.configured()) {
+            JPanel onlineP = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+            onlineP.setOpaque(false);
+            onlineP.add(onlineC);
+            row(c, 8, I18n.t("Приватність"), onlineP, null);
+        }
 
         JPanel btns = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 0));
         btns.setOpaque(false);
@@ -1043,7 +1333,7 @@ final class LauncherWindow extends JFrame {
     void fillJava(List<JavaFinder.Inst> found) {
         javaSync = true;
         javaC.removeAllItems();
-        javaC.addItem(javaBuiltin);
+        javaC.addItem(javaAuto);
         for (JavaFinder.Inst i : found) javaC.addItem(i);
         javaC.addItem(javaCustom);
         javaSync = false;
@@ -1054,7 +1344,7 @@ final class LauncherWindow extends JFrame {
         if (javaSync) return;
         String t = javaF.getText().trim();
         JavaFinder.Inst pick = javaCustom;
-        if (t.isEmpty()) pick = javaBuiltin;
+        if (t.isEmpty()) pick = javaAuto;
         else for (int i = 0; i < javaC.getItemCount(); i++) {
             JavaFinder.Inst it = javaC.getItemAt(i);
             if (it.path() != null && !it.path().isEmpty() && it.path().equalsIgnoreCase(t)) { pick = it; break; }
@@ -1085,6 +1375,7 @@ final class LauncherWindow extends JFrame {
         String did = cfg.get("discord", "").trim();
         discF.setText(did.isEmpty() ? Theme.DISCORD_ID : did);
         discC.setSelected(cfg.getb("discordOn", true));
+        onlineC.setSelected(cfg.getb("onlineOn", true));
         javaF.setText(cfg.get("java", ""));
         syncJavaCombo();
         jvmF.setText(cfg.get("jvm", ""));
@@ -1106,6 +1397,7 @@ final class LauncherWindow extends JFrame {
         if (discF.getText().trim().isEmpty()) discF.setText(Theme.DISCORD_ID);
         cfg.set("discord", discF.getText().trim());
         cfg.set("discordOn", String.valueOf(discC.isSelected()));
+        cfg.set("onlineOn", String.valueOf(onlineC.isSelected()));
         cfg.set("java", javaPath());
         cfg.set("jvm", jvmF.getText().trim());
         cfg.set("ram", String.valueOf(ram.getValue() * 512));
@@ -2435,7 +2727,7 @@ final class LauncherWindow extends JFrame {
         ta.setFont(Theme.font(Font.PLAIN, 13));
         JScrollPane sp = new JScrollPane(ta);
         sp.setPreferredSize(new Dimension(560, 300));
-        Dlg.show(this, I18n.t("Перенесення модів"), sp, I18n.t("Закрити"), I18n.t("Закрити"));
+        Dlg.show(this, I18n.t("Перенесення модів"), sp, I18n.t("Закрити"), null);
     }
 
     final AtomicInteger iSeq = new AtomicInteger();
@@ -2871,7 +3163,7 @@ final class LauncherWindow extends JFrame {
             @Override protected void paintComponent(Graphics g0) {
                 Graphics2D g = (Graphics2D) g0.create();
                 int w = getWidth(), h = getHeight(), y0 = Theme.TITLE_H;
-                Art.cover(g, Art.get(Art.FIREWORKS), 0, y0, w, h - y0, 0.35);
+                Art.coverCached(g, Art.get(Art.LOGIN), 0, y0, w, h - y0, 0.5);
                 g.setPaint(new GradientPaint(0, y0, Theme.light ? new Color(243, 244, 247, 175) : new Color(12, 13, 16, 150), 0, h, Theme.light ? new Color(243, 244, 247, 238) : new Color(12, 13, 16, 225)));
                 g.fillRect(0, y0, w, h - y0);
                 g.dispose();
@@ -3268,6 +3560,21 @@ final class LauncherWindow extends JFrame {
         }, "java-download").start();
     }
 
+    // При першому запуску (options.txt ще немає) ставимо українську мову гри.
+    // Далі файл належить гравцеві й лаунчер його більше не чіпає.
+    void firstLaunchLang(Path gd, String mc) {
+        try {
+            Path opt = gd.resolve("options.txt");
+            if (Files.exists(opt)) return;
+            // до 1.11 код мови писався з великою регіональною частиною: uk_UA, далі uk_ua
+            java.util.regex.Matcher m = Pattern.compile("^1\\.(\\d+)").matcher(mc == null ? "" : mc);
+            boolean legacy = m.find() && Integer.parseInt(m.group(1)) < 11;
+            String code = legacy ? "uk_UA" : "uk_ua";
+            Files.writeString(opt, "lang:" + code + "\n", StandardCharsets.UTF_8);
+            log(I18n.t("Перший запуск: мову гри встановлено ") + code);
+        } catch (Exception ignored) { }
+    }
+
     void play() {
         Accounts.Acc acc = accounts.current();
         if (acc == null) { msg(I18n.t("Спочатку обери обліківку.")); showLogin(); return; }
@@ -3292,6 +3599,7 @@ final class LauncherWindow extends JFrame {
                 pg.update(I18n.t("Перевірка обліківки…"), 0);
                 Accounts.Acc a = accounts.ensureFresh(acc, Accounts.LEGACY_CID);
                 List<String> cmd = engine.build(v, cfg, a, pg, gd);
+                firstLaunchLang(gd, Json.string(v.get("_jar")) != null ? Json.string(v.get("_jar")) : it.id());
                 String line = String.join(" ", cmd);
                 if (a.token().length() > 3) line = line.replace(a.token(), "***");
                 log(I18n.t("Запуск: ") + (line.length() > 500 ? line.substring(0, 500) + " …" : line));

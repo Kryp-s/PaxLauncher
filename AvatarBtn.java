@@ -56,7 +56,9 @@ final class AvatarBtn extends JButton {
     @Override protected void paintComponent(Graphics g0) {
         Graphics2D g = (Graphics2D) g0.create();
         Theme.aa(g);
-        int w = getWidth(), h = getHeight();
+        double k = Theme.S;
+        g.scale(k, k);
+        int w = (int) Math.round(getWidth() / k), h = (int) Math.round(getHeight() / k);
         Fx.squeeze(g, w, h, fx.p());
         if (fx.h() > 0) {
             g.setColor(Theme.ov(Math.round(16 * fx.h())));

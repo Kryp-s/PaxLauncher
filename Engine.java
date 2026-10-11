@@ -44,6 +44,7 @@ final class Engine {
     final Path root;
     final Consumer<String> log;
     final HttpClient http = HttpClient.newBuilder()
+            .version(HttpClient.Version.HTTP_1_1)
             .followRedirects(HttpClient.Redirect.NORMAL)
             .connectTimeout(Duration.ofSeconds(15)).build();
     final Map<String, String> urls = new ConcurrentHashMap<>();
@@ -136,6 +137,37 @@ final class Engine {
         } catch (IOException e) { return null; }
     }
 
+    String autoJava(int need) throws IOException {
+        List<JavaFinder.Inst> all = JavaFinder.cached();
+        if (need <= 0) {
+            for (JavaFinder.Inst i : all) if (i.major() > 0) return i.path();
+            Path mj = managedJava(17);
+            if (mj != null) return mj.toString();
+            String own = ownRuntimeJava(0);
+            if (own != null) return own;
+            throw new JavaMissing(17);
+        }
+        for (JavaFinder.Inst i : all) if (i.major() == need) return i.path();
+        Path mj = managedJava(need);
+        if (mj != null) return mj.toString();
+        JavaFinder.Inst best = null;
+        for (JavaFinder.Inst i : all) if (i.major() > need && (best == null || i.major() < best.major())) best = i;
+        if (best != null) return best.path();
+        String own = ownRuntimeJava(need);
+        if (own != null) return own;
+        throw new JavaMissing(need);
+    }
+
+    private String ownRuntimeJava(int need) {
+        if (Runtime.version().feature() < need) return null;
+        Path bin = Path.of(System.getProperty("java.home"), "bin");
+        for (String n : new String[]{"java.exe", "java", "javaw.exe"}) {
+            Path p = bin.resolve(n);
+            if (Files.isRegularFile(p)) return p.toString();
+        }
+        return null;
+    }
+
     static void deleteTree(Path p) {
         if (!Files.exists(p)) return;
         try (var w = Files.walk(p)) { w.sorted(Comparator.reverseOrder()).forEach(f -> f.toFile().delete()); } catch (IOException ignored) { }
@@ -223,9 +255,10 @@ final class Engine {
         Files.createDirectories(dest.getParent());
         Path tmp = dest.resolveSibling(dest.getFileName() + ".part");
         Exception last = null;
-        for (int t = 0; t < 3; t++) {
+        for (int t = 0; t < 5; t++) {
             if (cancel.getAsBoolean()) throw new Cancelled();
             waitPause(cancel);
+            if (t > 0) { try { Thread.sleep(400L * t); } catch (InterruptedException ie) { throw new Cancelled(); } }
             try {
                 HttpRequest r = HttpRequest.newBuilder(URI.create(url))
                         .header("User-Agent", "PaxLauncher/1.0").timeout(Duration.ofMinutes(5)).build();
@@ -253,7 +286,7 @@ final class Engine {
                 try { Files.deleteIfExists(tmp); } catch (IOException ignored) { }
             }
         }
-        throw last;
+        throw new IOException(url + " — " + last, last);
     }
 
     List<VInfo> loadManifest() throws Exception {
@@ -495,9 +528,7 @@ final class Engine {
 
         pg.update(I18n.t("Встановлення ") + loader + I18n.t(" (це може зайняти кілька хвилин)…"), 0.45);
         Set<String> before = new HashSet<>(installedIds());
-        String java = javaPath.isEmpty()
-                ? Path.of(System.getProperty("java.home"), "bin", osName().equals("windows") ? "java.exe" : "java").toString()
-                : javaPath;
+        String java = javaPath.isEmpty() ? autoJava(0) : javaPath;
         Process pr = new ProcessBuilder(java, "-jar", inst.toString(), "--installClient", root.toString())
                 .directory(root.toFile()).redirectErrorStream(true).start();
         proc = pr;
@@ -566,7 +597,7 @@ final class Engine {
 
     private void runTasks(List<Task> tasks, Progress pg) throws Exception {
         if (tasks.isEmpty()) return;
-        ExecutorService pool = Executors.newFixedThreadPool(12);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
         AtomicInteger done = new AtomicInteger();
         int total = tasks.size();
         List<Future<Object>> fs = new ArrayList<>();
@@ -617,16 +648,11 @@ final class Engine {
 
         String javaPath = cfg.get("java", "").trim();
         if (!javaPath.isEmpty() && (javaPath.contains("/") || javaPath.contains("\\")) && !Files.isRegularFile(Path.of(javaPath)))
-            throw new IOException(I18n.t("Файл Java не знайдено:\n") + javaPath + I18n.t("\nОбери Java в Налаштуваннях або очисти поле, щоб використати вбудовану."));
+            throw new IOException(I18n.t("Файл Java не знайдено:\n") + javaPath + I18n.t("\nОбери Java в Налаштуваннях або вибери «Автоматично»."));
         String javaExe = javaPath;
-        Object need = g(v, "javaVersion", "majorVersion");
-        if (javaPath.isEmpty() && need instanceof Number) {
-            int n = ((Number) need).intValue();
-            if (Runtime.version().feature() < n) {
-                Path mj = managedJava(n);
-                if (mj == null) throw new JavaMissing(n);
-                javaExe = mj.toString();
-            }
+        if (javaPath.isEmpty()) {
+            Object need = g(v, "javaVersion", "majorVersion");
+            javaExe = autoJava(need instanceof Number ? ((Number) need).intValue() : 0);
         }
 
         Set<String> feats = new HashSet<>();
@@ -757,9 +783,7 @@ final class Engine {
         ph.put("game_assets", gameAssets.toString());
 
         List<String> cmd = new ArrayList<>();
-        cmd.add(javaExe.isEmpty()
-                ? Path.of(System.getProperty("java.home"), "bin", osName().equals("windows") ? "java.exe" : "java").toString()
-                : javaExe);
+        cmd.add(javaExe);
         int ram = cfg.geti("ram", 4096);
         cmd.add("-Xmx" + ram + "M");
         cmd.add("-Xms" + Math.min(ram, 1024) + "M");

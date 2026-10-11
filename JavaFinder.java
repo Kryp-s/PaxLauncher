@@ -31,8 +31,16 @@ import javax.swing.border.*;
 import javax.swing.plaf.basic.*;
 
 final class JavaFinder {
-    record Inst(String label, String path) {
+    record Inst(String label, String path, int major) {
+        Inst(String label, String path) { this(label, path, 0); }
         @Override public String toString() { return label; }
+    }
+
+    private static volatile List<Inst> cache;
+
+    static synchronized List<Inst> cached() {
+        List<Inst> c = cache;
+        return c != null ? c : scan();
     }
 
     static int major(String v) {
@@ -51,25 +59,38 @@ final class JavaFinder {
     }
 
     private static String[] info(Path exe) {
-        String ver = "", vendor = "";
+        String ver = "", vendor = "", home = "";
         try {
             Path rel = exe.getParent().getParent().resolve("release");
             if (Files.isRegularFile(rel)) {
                 String t = Files.readString(rel, StandardCharsets.UTF_8);
                 ver = quoted(t, "JAVA_VERSION");
                 vendor = quoted(t, "IMPLEMENTOR");
+                home = exe.getParent().getParent().toRealPath().toString();
             }
         } catch (Exception ignored) { }
-        if (ver.isEmpty()) {
+        if (ver.isEmpty() || home.isEmpty()) {
             try {
-                Process pr = new ProcessBuilder(exe.toString(), "-version").redirectErrorStream(true).start();
+                Process pr = new ProcessBuilder(exe.toString(), "-XshowSettings:properties", "-version").redirectErrorStream(true).start();
                 String out = new String(pr.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-                if (!pr.waitFor(4, TimeUnit.SECONDS)) pr.destroyForcibly();
-                int a = out.indexOf('"'), b = a < 0 ? -1 : out.indexOf('"', a + 1);
-                if (a >= 0 && b > a) ver = out.substring(a + 1, b);
+                if (!pr.waitFor(5, TimeUnit.SECONDS)) pr.destroyForcibly();
+                for (String line : out.split("\\R")) {
+                    String l = line.trim();
+                    if (l.startsWith("java.home = ")) home = l.substring(12).trim();
+                    else if (ver.isEmpty() && l.startsWith("java.version = ")) ver = l.substring(15).trim();
+                    else if (vendor.isEmpty() && l.startsWith("java.vendor = ")) vendor = l.substring(14).trim();
+                }
+                if (!home.isEmpty()) try { home = Path.of(home).toRealPath().toString(); } catch (Exception ignored) { }
             } catch (Exception ignored) { }
         }
-        return new String[]{ver, vendor};
+        return new String[]{ver, vendor, home};
+    }
+
+    private static int rank(String path) {
+        String p = path.toLowerCase(Locale.ROOT);
+        if (p.contains("appdata") || p.contains(".minecraft") || p.contains("prismlauncher") || p.contains("\\.jdks") || p.contains("/.jdks")) return 1;
+        if (p.contains("common files")) return 2;
+        return 0;
     }
 
     static List<Inst> scan() {
@@ -81,6 +102,7 @@ final class JavaFinder {
         List<Path> exes = new ArrayList<>();
         String jh = System.getenv("JAVA_HOME");
         if (jh != null && !jh.isBlank()) exes.add(Path.of(jh, "bin", exeName));
+        try { exes.add(Path.of(System.getProperty("java.home"), "bin", exeName)); } catch (Exception ignored) { }
         String path = System.getenv("PATH");
         if (path != null) for (String d : path.split(File.pathSeparator)) {
             if (!d.isBlank()) try { exes.add(Path.of(d.replace("\"", ""), exeName)); } catch (Exception ignored) { }
@@ -123,7 +145,6 @@ final class JavaFinder {
         }
 
         Set<String> seen = new HashSet<>();
-        try { seen.add(Path.of(System.getProperty("java.home"), "bin", exeName).toRealPath().toString()); } catch (Exception ignored) { }
 
         List<Object[]> found = new ArrayList<>();
         for (Path e : exes) {
@@ -131,20 +152,29 @@ final class JavaFinder {
                 if (!Files.isRegularFile(e)) continue;
                 if (!seen.add(e.toRealPath().toString())) continue;
                 String[] inf = info(e);
-                found.add(new Object[]{major(inf[0]), inf[0], inf[1], e.toString()});
+                found.add(new Object[]{major(inf[0]), inf[0], inf[1], e.toString(), inf[2]});
             } catch (Exception ignored) { }
         }
         found.sort((a, b) -> {
             int c = Integer.compare((Integer) b[0], (Integer) a[0]);
+            if (c != 0) return c;
+            c = Integer.compare(rank((String) a[3]), rank((String) b[3]));
             return c != 0 ? c : ((String) a[3]).compareToIgnoreCase((String) b[3]);
         });
+
+        Set<String> homes = new HashSet<>();
+        Set<Integer> majors = new HashSet<>();
         List<Inst> out = new ArrayList<>();
         for (Object[] f : found) {
             int mj = (Integer) f[0];
-            String vendor = (String) f[2];
-            String label = (mj > 0 ? "Java " + mj : "Java") + (vendor.isEmpty() ? "" : " (" + vendor + ")") + " — " + f[3];
-            out.add(new Inst(label, (String) f[3]));
+            String ver = (String) f[1], vendor = (String) f[2], exe = (String) f[3], jhome = (String) f[4];
+            if (!jhome.isEmpty() && !homes.add(jhome.toLowerCase(Locale.ROOT))) continue;
+            if (mj > 0 && !majors.add(mj)) continue;
+            String label = mj > 0 ? "Java " + mj : "Java";
+            label += "  · " + exe;
+            out.add(new Inst(label, exe, mj));
         }
+        cache = out;
         return out;
     }
 }

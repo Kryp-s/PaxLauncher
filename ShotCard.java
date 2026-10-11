@@ -50,18 +50,17 @@ final class ShotCard extends JComponent {
         this.shot = shot;
         this.win = win;
         this.date = fmtDate(shot.time());
-        setPreferredSize(new Dimension(W, H));
         setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         MouseAdapter ma = new MouseAdapter() {
             @Override public void mouseEntered(MouseEvent e) { hover = true; repaint(); }
             @Override public void mouseExited(MouseEvent e) { hover = false; copyHover = false; repaint(); }
             @Override public void mouseMoved(MouseEvent e) {
-                boolean c = copyRect().contains(e.getPoint());
+                boolean c = copyRect().contains(base(e.getPoint()));
                 if (c != copyHover) { copyHover = c; repaint(); }
             }
             @Override public void mouseClicked(MouseEvent e) {
                 if (!SwingUtilities.isLeftMouseButton(e)) return;
-                if (copyRect().contains(e.getPoint())) win.copyShot(shot); else win.openShot(shot);
+                if (copyRect().contains(base(e.getPoint()))) win.copyShot(shot); else win.openShot(shot);
             }
         };
         addMouseListener(ma);
@@ -69,11 +68,15 @@ final class ShotCard extends JComponent {
         win.loadThumb(this);
     }
 
+    @Override public Dimension getPreferredSize() { return new Dimension(Theme.px(W), Theme.px(H)); }
+
     private Rectangle copyRect() {
-        FontMetrics fm = getFontMetrics(Theme.font(Font.BOLD, 12));
+        FontMetrics fm = getFontMetrics(Theme.fontRaw(Font.BOLD, 12));
         int cw = fm.stringWidth(copyText) + 22;
         return new Rectangle(W - 8 - cw, H - 32, cw, 24);
     }
+
+    private static Point base(Point p) { return new Point((int) Math.round(p.x / Theme.S), (int) Math.round(p.y / Theme.S)); }
 
     private static String ellipsize(String s, FontMetrics fm, int max) {
         if (fm.stringWidth(s) <= max) return s;
@@ -84,7 +87,9 @@ final class ShotCard extends JComponent {
     @Override protected void paintComponent(Graphics g0) {
         Graphics2D g = (Graphics2D) g0.create();
         Theme.aa(g);
-        int w = getWidth(), h = getHeight();
+        double k = Theme.S;
+        g.scale(k, k);
+        int w = (int) Math.round(getWidth() / k), h = (int) Math.round(getHeight() / k);
         g.setColor(Theme.CARD);
         g.fillRoundRect(0, 0, w, h, 16, 16);
         if (hover) {
@@ -92,7 +97,7 @@ final class ShotCard extends JComponent {
             g.drawRoundRect(0, 0, w - 1, h - 1, 16, 16);
         }
         Shape old = g.getClip();
-        g.setClip(new RoundRectangle2D.Float(6, 6, IW, IH, 12, 12));
+        g.clip(new RoundRectangle2D.Float(6, 6, IW, IH, 12, 12));
         BufferedImage t = thumb;
         if (t != null) g.drawImage(t, 6, 6, IW, IH, null);
         else {
@@ -101,18 +106,18 @@ final class ShotCard extends JComponent {
         }
         g.setClip(old);
 
-        g.setFont(Theme.font(Font.BOLD, 13));
+        g.setFont(Theme.fontRaw(Font.BOLD, 13));
         g.setColor(Theme.TEXT);
         g.drawString(ellipsize(shot.label(), g.getFontMetrics(), W - 20), 12, 6 + IH + 20);
 
-        g.setFont(Theme.font(Font.PLAIN, 12));
+        g.setFont(Theme.fontRaw(Font.PLAIN, 12));
         g.setColor(Theme.MUTED);
         g.drawString(date, 12, H - 14);
 
         Rectangle cr = copyRect();
         g.setColor(copyHover ? Theme.acc(70) : Theme.ov(14));
         g.fillRoundRect(cr.x, cr.y, cr.width, cr.height, 12, 12);
-        g.setFont(Theme.font(Font.BOLD, 12));
+        g.setFont(Theme.fontRaw(Font.BOLD, 12));
         FontMetrics fm = g.getFontMetrics();
         g.setColor(copyHover ? Theme.ACC2 : Theme.TEXT);
         g.drawString(copyText, cr.x + (cr.width - fm.stringWidth(copyText)) / 2, cr.y + (cr.height - fm.getHeight()) / 2 + fm.getAscent());

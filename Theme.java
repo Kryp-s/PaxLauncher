@@ -165,13 +165,25 @@ final class Theme {
         c.repaint();
     }
 
-    static final int TITLE_H = 48, SIDE_W = 76;
+    static int TITLE_H = 48, SIDE_W = 76;
+
+    static double S = 1.0;
+
+    static int px(int v) { return (int) Math.round(v * S); }
+
+    static void setScale(double s) {
+        S = s;
+        TITLE_H = px(48);
+        SIDE_W = px(76);
+    }
     static final String DISCORD_ID = "1558210355229106416";
 
     private static final Font BASE_FONT = new Font("Segoe UI", Font.PLAIN, 14);
     private static final Map<Long, Font> FONTS = new ConcurrentHashMap<>();
 
-    static Font font(int style, float size) {
+    static Font font(int style, float size) { return fontRaw(style, (float) (size * S)); }
+
+    static Font fontRaw(int style, float size) {
         long k = ((long) style << 32) | (Float.floatToIntBits(size) & 0xFFFFFFFFL);
         Font f = FONTS.get(k);
         if (f == null) { f = BASE_FONT.deriveFont(style, size); FONTS.put(k, f); }

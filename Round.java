@@ -61,12 +61,13 @@ final class Round {
         g.dispose();
     }
 
-    static void apply(Window w, java.util.function.IntSupplier arc) {
+    static Runnable apply(Window w, java.util.function.IntSupplier arc) {
         w.setBackground(Theme.BG2);
         Runnable upd = () -> {
             try {
                 int a = arc.getAsInt();
-                if (a <= 0 || w.getWidth() <= 0) w.setShape(null);
+                if (a < 0) return;
+                if (a == 0 || w.getWidth() <= 0) w.setShape(null);
                 else w.setShape(new RoundRectangle2D.Double(0, 0, w.getWidth(), w.getHeight(), a * 2, a * 2));
             } catch (RuntimeException ignored) { }
         };
@@ -74,5 +75,6 @@ final class Round {
             @Override public void componentResized(ComponentEvent e) { upd.run(); }
             @Override public void componentShown(ComponentEvent e) { upd.run(); }
         });
+        return upd;
     }
 }

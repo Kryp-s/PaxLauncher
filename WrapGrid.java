@@ -31,16 +31,20 @@ import javax.swing.border.*;
 import javax.swing.plaf.basic.*;
 
 final class WrapGrid implements LayoutManager {
-    private final int cw, ch, gap;
+    private final int bcw, bch, bgap;
     private int lastRows = -1;
 
-    WrapGrid(int cw, int ch, int gap) { this.cw = cw; this.ch = ch; this.gap = gap; }
+    WrapGrid(int cw, int ch, int gap) { this.bcw = cw; this.bch = ch; this.bgap = gap; }
+
+    private int cw() { return Theme.px(bcw); }
+    private int ch() { return Theme.px(bch); }
+    private int gap() { return Theme.px(bgap); }
 
     private int cols(Container t) {
         int w = t.getWidth();
         Container v = SwingUtilities.getAncestorOfClass(JViewport.class, t);
         if (v != null && v.getWidth() > 0) w = v.getWidth();
-        return Math.max(1, (w + gap) / (cw + gap));
+        return Math.max(1, (w + gap()) / (cw() + gap()));
     }
 
     @Override public void addLayoutComponent(String n, Component c) { }
@@ -49,14 +53,14 @@ final class WrapGrid implements LayoutManager {
 
     @Override public Dimension preferredLayoutSize(Container t) {
         int n = t.getComponentCount(), c = cols(t), rows = (n + c - 1) / c;
-        return new Dimension(c * (cw + gap) - gap, rows == 0 ? 0 : rows * (ch + gap) - gap);
+        return new Dimension(c * (cw() + gap()) - gap(), rows == 0 ? 0 : rows * (ch() + gap()) - gap());
     }
 
-    @Override public Dimension minimumLayoutSize(Container t) { return new Dimension(cw, 0); }
+    @Override public Dimension minimumLayoutSize(Container t) { return new Dimension(cw(), 0); }
 
     @Override public void layoutContainer(Container t) {
         int n = t.getComponentCount(), c = cols(t);
-        for (int i = 0; i < n; i++) t.getComponent(i).setBounds((i % c) * (cw + gap), (i / c) * (ch + gap), cw, ch);
+        for (int i = 0; i < n; i++) t.getComponent(i).setBounds((i % c) * (cw() + gap()), (i / c) * (ch() + gap()), cw(), ch());
         int rows = (n + c - 1) / c;
         if (rows != lastRows) {
             lastRows = rows;

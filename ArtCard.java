@@ -37,15 +37,15 @@ final class ArtCard extends JComponent {
     private final String title, desc;
     private final Fx fx = new Fx(this);
     private BufferedImage masked;
-    private int maskW;
+    private int maskW, maskH;
+    private BufferedImage masked2;
+    private int mask2W, mask2H;
 
     ArtCard(int art, double focus, String title, String desc, Runnable click) {
         this.art = art;
         this.focus = focus;
         this.title = title;
         this.desc = desc;
-        setPreferredSize(new Dimension(300, H));
-        setMinimumSize(new Dimension(180, H));
         setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         addMouseListener(new MouseAdapter() {
             @Override public void mouseEntered(MouseEvent e) { fx.hover(true); }
@@ -54,7 +54,13 @@ final class ArtCard extends JComponent {
         });
     }
 
-    static BufferedImage topRounded(BufferedImage im, int w, int h, double focus) {
+    @Override public Dimension getPreferredSize() { return new Dimension(Theme.px(300), Theme.px(H)); }
+
+    @Override public Dimension getMinimumSize() { return new Dimension(Theme.px(180), Theme.px(H)); }
+
+    static BufferedImage topRounded(BufferedImage im, int w, int h, double focus) { return topRounded(im, w, h, focus, 16); }
+
+    static BufferedImage topRounded(BufferedImage im, int w, int h, double focus, int rad) {
         BufferedImage img = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
         Graphics2D ig = img.createGraphics();
         Theme.aa(ig);
@@ -64,7 +70,7 @@ final class ArtCard extends JComponent {
         Graphics2D mg = out.createGraphics();
         Theme.aa(mg);
         mg.setColor(Color.WHITE);
-        mg.fillRoundRect(0, 0, w, h + 24, 16, 16);
+        mg.fillRoundRect(0, 0, w, h + 24, rad, rad);
         mg.setComposite(AlphaComposite.SrcIn);
         mg.drawImage(img, 0, 0, null);
         mg.dispose();
@@ -95,15 +101,28 @@ final class ArtCard extends JComponent {
     @Override protected void paintComponent(Graphics g0) {
         Graphics2D g = (Graphics2D) g0.create();
         Theme.aa(g);
-        int w = getWidth(), h = getHeight();
-        if (w <= 0) { g.dispose(); return; }
-        if (masked == null || maskW != w) {
-            masked = topRounded(Art.get(art), w, IMG_H, focus);
-            maskW = w;
+        double k = Theme.S;
+        int pw = getWidth(), ph = getHeight();
+        if (pw <= 0) { g.dispose(); return; }
+        int imgPx = (int) Math.round(IMG_H * k);
+        if (masked == null || maskW != pw || maskH != imgPx) {
+            BufferedImage prev = masked;
+            int pwid = maskW, phei = maskH;
+            if (masked2 != null && mask2W == pw && mask2H == imgPx) masked = masked2;
+            else masked = topRounded(Art.get(art), pw, imgPx, focus, (int) Math.round(16 * k));
+            masked2 = prev;
+            mask2W = pwid;
+            mask2H = phei;
+            maskW = pw;
+            maskH = imgPx;
         }
+        g.scale(k, k);
+        int w = (int) Math.round(pw / k), h = (int) Math.round(ph / k);
         g.setColor(Theme.CARD);
         g.fillRoundRect(0, 0, w, h, 16, 16);
-        g.drawImage(masked, 0, 0, null);
+        Graphics2D gi = (Graphics2D) g0.create();
+        gi.drawImage(masked, 0, 0, null);
+        gi.dispose();
         if (fx.h() > 0) {
             g.setColor(Theme.ov(Math.round(12 * fx.h())));
             g.fillRoundRect(0, 0, w, h, 16, 16);
@@ -112,10 +131,10 @@ final class ArtCard extends JComponent {
             g.drawRoundRect(1, 1, w - 3, h - 3, 16, 16);
         }
         int pad = 16, y = IMG_H + 30;
-        g.setFont(Theme.font(Font.BOLD, 16));
+        g.setFont(Theme.fontRaw(Font.BOLD, 16));
         g.setColor(Theme.TEXT);
         g.drawString(title, pad, y);
-        g.setFont(Theme.font(Font.PLAIN, 13));
+        g.setFont(Theme.fontRaw(Font.PLAIN, 13));
         FontMetrics fm = g.getFontMetrics();
         g.setColor(Theme.MUTED);
         int ly = y + 10 + fm.getAscent();

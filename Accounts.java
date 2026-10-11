@@ -184,7 +184,6 @@ final class Accounts {
         return a.equals("ely") ? saved(a) : null;
     }
 
-
     private final Map<String, java.awt.image.BufferedImage> heads = new ConcurrentHashMap<>();
 
     private Path headFile(String uuid) { return file.getParent().resolve("heads").resolve(uuid + ".png"); }

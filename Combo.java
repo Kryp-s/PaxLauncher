@@ -32,6 +32,7 @@ import javax.swing.plaf.basic.*;
 
 final class Combo<T> extends JComboBox<T> {
     boolean iconed;
+    boolean wideList;
 
     void refreshTheme() {
         setUI(new ComboUI());
@@ -68,7 +69,7 @@ final class Combo<T> extends JComboBox<T> {
                 if (sub.isEmpty()) return;
                 Graphics2D g = (Graphics2D) g0.create();
                 Theme.aa(g);
-                g.setFont(getFont().deriveFont(Font.PLAIN, 12f));
+                g.setFont(getFont().deriveFont(Font.PLAIN, (float) (12 * Theme.S)));
                 FontMetrics fm = g.getFontMetrics();
                 int x = getWidth() - 14 - fm.stringWidth(sub);
                 if (x > 14 + getFontMetrics(getFont()).stringWidth(getText()) + 12) {
@@ -132,16 +133,16 @@ final class Combo<T> extends JComboBox<T> {
                 String full = String.valueOf(v), main = full, sub = "";
                 int k = full.indexOf("  · ");
                 if (k >= 0) { main = full.substring(0, k); sub = full.substring(k + 4); }
-                int is = 38;
+                int is = Theme.px(38);
                 g2.drawImage(Theme.icon(is), r.x + 8, r.y + (r.height - is) / 2, null);
                 int tx = r.x + 8 + is + 12;
-                g2.setFont(comboBox.getFont().deriveFont(Font.BOLD, 15f));
+                g2.setFont(comboBox.getFont().deriveFont(Font.BOLD, (float) (15 * Theme.S)));
                 FontMetrics fm1 = g2.getFontMetrics();
                 g2.setColor(comboBox.isEnabled() ? Theme.TEXT : Theme.MUTED);
                 if (sub.isEmpty()) g2.drawString(main, tx, r.y + (r.height - fm1.getHeight()) / 2 + fm1.getAscent());
                 else {
                     g2.drawString(main, tx, r.y + r.height / 2 - 2);
-                    g2.setFont(comboBox.getFont().deriveFont(Font.PLAIN, 12f));
+                    g2.setFont(comboBox.getFont().deriveFont(Font.PLAIN, (float) (12 * Theme.S)));
                     g2.setColor(Theme.MUTED);
                     g2.drawString(sub, tx, r.y + r.height / 2 + 14);
                 }
@@ -157,7 +158,7 @@ final class Combo<T> extends JComboBox<T> {
             int ty = r.y + (r.height - fm.getHeight()) / 2 + fm.getAscent();
             g2.drawString(main, r.x + 12, ty);
             if (!note.isEmpty()) {
-                g2.setFont(comboBox.getFont().deriveFont(Font.PLAIN, 12f));
+                g2.setFont(comboBox.getFont().deriveFont(Font.PLAIN, (float) (12 * Theme.S)));
                 g2.setColor(Theme.MUTED);
                 g2.drawString(note, r.x + 12 + fm.stringWidth(main) + 10, ty);
             }
@@ -166,6 +167,24 @@ final class Combo<T> extends JComboBox<T> {
 
         @Override protected ComboPopup createPopup() {
             BasicComboPopup p = new BasicComboPopup(comboBox) {
+                @Override protected Rectangle computePopupBounds(int px, int py, int pw, int ph) {
+                    if (comboBox instanceof Combo && ((Combo<?>) comboBox).wideList) {
+                        FontMetrics m1 = comboBox.getFontMetrics(Theme.font(Font.PLAIN, 14));
+                        FontMetrics m2 = comboBox.getFontMetrics(Theme.font(Font.PLAIN, 12));
+                        int need = pw;
+                        for (int i = 0; i < comboBox.getItemCount(); i++) {
+                            String full = String.valueOf(comboBox.getItemAt(i)), main = full, sub = "";
+                            int k = full.indexOf("  · ");
+                            if (k >= 0) { main = full.substring(0, k); sub = full.substring(k + 4); }
+                            need = Math.max(need, m1.stringWidth(main) + (sub.isEmpty() ? 0 : m2.stringWidth(sub) + 24) + 28 + 24);
+                        }
+                        Window w = SwingUtilities.getWindowAncestor(comboBox);
+                        if (w != null) need = Math.min(need, Math.max(pw, w.getWidth() - 80));
+                        pw = need;
+                    }
+                    return super.computePopupBounds(px, py, pw, ph);
+                }
+
                 @Override protected JScrollPane createScroller() {
                     JScrollPane sp = super.createScroller();
                     sp.setBorder(null);

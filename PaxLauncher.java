@@ -63,7 +63,7 @@ public class PaxLauncher {
     static final String[] LEAN_FLAGS = {
         "-XX:+IgnoreUnrecognizedVMOptions",
         "-XX:+UseSerialGC",
-        "-Xms8m", "-Xmx160m",
+        "-Xms8m", "-Xmx256m",
         "-XX:MinHeapFreeRatio=10", "-XX:MaxHeapFreeRatio=25",
         "-XX:TieredStopAtLevel=1",
         "-XX:CICompilerCount=1",
