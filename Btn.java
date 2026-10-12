@@ -130,7 +130,6 @@ final class Btn extends JButton {
                 g.fillRect(0, 0, w, h);
             }
             g.setColor(fg);
-            // значки кнопок вікна (згорнути / розгорнути / закрити) ростуть разом із інтерфейсом
             double k = Math.max(1.0, Theme.S);
             int cx = w / 2, cy = h / 2;
             int u = (int) Math.round(7 * k), s4 = (int) Math.round(4 * k), s3 = (int) Math.round(3 * k), s11 = (int) Math.round(11 * k);

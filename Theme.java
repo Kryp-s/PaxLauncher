@@ -183,7 +183,6 @@ final class Theme {
 
     static Font font(int style, float size) { return fontRaw(style, (float) (size * S)); }
 
-    // Кнопки на весь екран ростуть трохи повільніше за решту інтерфейсу (BTN_K = 1 — як усе інше).
     static final double BTN_K = 0.65;
 
     static double bs(double s) { return 1 + (s - 1) * BTN_K; }

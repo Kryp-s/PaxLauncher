@@ -62,7 +62,7 @@ final class Accounts {
         }
     }
 
-    private void save() {
+    private synchronized void save() {
         try {
             Properties out = new Properties();
             out.putAll(p);
@@ -229,7 +229,7 @@ final class Accounts {
             URI u = URI.create(url);
             String host = u.getHost() == null ? "" : u.getHost().toLowerCase();
             if (!(host.equals("minecraft.net") || host.endsWith(".minecraft.net") || host.endsWith(".ely.by"))) return null;
-            if ("http".equalsIgnoreCase(u.getScheme())) u = URI.create("https" + url.substring(4));   // Mojang досі віддає http://textures…
+            if ("http".equalsIgnoreCase(u.getScheme())) u = URI.create("https" + url.substring(4));
             else if (!"https".equalsIgnoreCase(u.getScheme())) return null;
             HttpRequest rq = HttpRequest.newBuilder(u).header("User-Agent", "PaxLauncher/1.0")
                     .timeout(Duration.ofSeconds(20)).GET().build();

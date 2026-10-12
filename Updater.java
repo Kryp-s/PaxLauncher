@@ -130,11 +130,27 @@ final class Updater {
         try { return d.isEmpty() ? 0 : Integer.parseInt(d); } catch (NumberFormatException e) { return 0; }
     }
 
+    static final int COUNTDOWN = 7;
+
+    private static String countdownText(Release r, int sec) {
+        return I18n.t("Знайдено нову версію ") + r.version()
+                + I18n.t(". Запускач закриється через ") + sec + I18n.t(" с і встановить оновлення.");
+    }
+
     static void apply(LauncherWindow win, Release r) {
-        JLabel msg = Dlg.text(I18n.t("Знайдено нову версію ") + r.version()
-                + I18n.t(". Запускач закриється й встановить оновлення."));
-        boolean now = Dlg.show(win, I18n.t("Оновлення"), msg, I18n.t("Оновити зараз"), I18n.t("Пізніше"));
-        if (!now) { log("користувач відклав оновлення " + r.version()); return; }
+        int[] left = {COUNTDOWN};
+        boolean[] auto = {false};
+        JLabel msg = Dlg.text(countdownText(r, left[0]));
+        boolean now = Dlg.show(win, I18n.t("Оновлення"), msg, I18n.t("Оновити зараз"), I18n.t("Пізніше"), d -> {
+            javax.swing.Timer tm = new javax.swing.Timer(1000, null);
+            tm.addActionListener(e -> {
+                if (!d.isDisplayable()) { tm.stop(); return; }
+                if (--left[0] <= 0) { tm.stop(); auto[0] = true; d.dispose(); }
+                else msg.setText(Dlg.text(countdownText(r, left[0])).getText());
+            });
+            tm.start();
+        });
+        if (!now && !auto[0]) { log("користувач відклав оновлення " + r.version()); return; }
         install(win, r);
     }
 

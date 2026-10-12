@@ -69,7 +69,6 @@ final class JavaFinder {
                 home = exe.getParent().getParent().toRealPath().toString();
             }
         } catch (Exception ignored) { }
-        // Не запускаємо невідомі java.exe, які поточний користувач може підмінити (без файлу release) — лише читаємо метадані.
         if ((ver.isEmpty() || home.isEmpty()) && !Files.isWritable(exe)) {
             try {
                 Process pr = new ProcessBuilder(exe.toString(), "-XshowSettings:properties", "-version").redirectErrorStream(true).start();

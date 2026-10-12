@@ -31,7 +31,6 @@ import javax.swing.border.*;
 import javax.swing.plaf.basic.*;
 
 final class Swatch extends JComponent {
-    // колір, обраний у налаштуваннях, але ще не збережений (null — показуємо поточний колір теми)
     static Color mark;
 
     private final Color col;

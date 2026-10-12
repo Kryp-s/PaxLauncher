@@ -102,7 +102,6 @@ final class Engine {
 
     static final int MAX_FETCH = 64 * 1024 * 1024;
 
-    /** Лише https (http із відомих старих описів мовчки піднімаємо до https). */
     static String httpsOnly(String url) throws IOException {
         if (url == null || url.isEmpty()) throw new IOException("empty url");
         if (url.regionMatches(true, 0, "http://", 0, 7)) url = "https://" + url.substring(7);
@@ -112,7 +111,6 @@ final class Engine {
         return url;
     }
 
-    /** Ідентифікатор версії стає частиною шляху на диску — лише безпечні символи. */
     static final Pattern ID_RE = Pattern.compile("[\\p{L}\\p{N}][\\p{L}\\p{N}._+\\- ()]{0,127}");
     static String safeId(String id) throws IOException {
         if (id == null || !ID_RE.matcher(id).matches() || id.contains("..") || id.endsWith(" ") || id.endsWith("."))
@@ -120,7 +118,6 @@ final class Engine {
         return id;
     }
 
-    /** base + rel, гарантовано всередині base (без «..», абсолютних шляхів і дисків). */
     static Path under(Path base, String rel) throws IOException {
         if (rel == null || rel.isEmpty()) throw new IOException("empty path");
         Path b = base.toAbsolutePath().normalize();
@@ -149,7 +146,6 @@ final class Engine {
             + "|UseCodeCacheFlushing|ShowCodeDetailsInExceptionMessages|DontCompileHugeMethods)(=[A-Za-z0-9_.\\-]{1,16})?"
             + "|-XX:HeapDumpPath=[A-Za-z0-9_.\\-]{1,128}");
 
-    /** Білий список JVM-аргументів з опису версії (опис може бути підміненим — не довіряємо). */
     static boolean jvmArgAllowed(String a) {
         if (a == null || a.isEmpty()) return false;
         if (a.startsWith("-D")) {
@@ -176,7 +172,6 @@ final class Engine {
 
     static String sha1(Path f) throws Exception { return digest(f, "SHA-1"); }
 
-    /** Алгоритм обираємо за довжиною очікуваного хешу: 128 = SHA-512, 64 = SHA-256, інакше SHA-1. */
     static String hashFor(Path f, String expected) throws Exception {
         int n = expected == null ? 0 : expected.length();
         return digest(f, n == 128 ? "SHA-512" : n == 64 ? "SHA-256" : "SHA-1");
@@ -261,7 +256,15 @@ final class Engine {
         String api = "https://api.adoptium.net/v3/assets/latest/" + n + "/hotspot?architecture=" + arch
                 + "&image_type=jre&os=" + os + "&vendor=eclipse";
         String url = null, sum = null;
-        for (Object o : l(Json.parse(fetch(api)))) {
+        String apiBody = null;
+        Exception apiErr = null;
+        for (int t = 0; t < 4 && apiBody == null; t++) {
+            if (stop) throw new Cancelled();
+            if (t > 0) { try { Thread.sleep(700L * t); } catch (InterruptedException ie) { throw new Cancelled(); } }
+            try { apiBody = fetch(api); } catch (Exception ex) { apiErr = ex; }
+        }
+        if (apiBody == null) throw new IOException(I18n.t("Не вдалося отримати відомості про Java з api.adoptium.net.") + "\n" + apiErr);
+        for (Object o : l(Json.parse(apiBody))) {
             Map<String, Object> pk = m(g(o, "binary", "package"));
             if (pk == null) continue;
             String link = s(pk.get("link")), cs = s(pk.get("checksum"));
@@ -273,27 +276,53 @@ final class Engine {
         Path part = base.resolve("java-" + n + (zip ? ".zip" : ".tar.gz") + ".part");
         String title = I18n.t("Завантаження Java ") + n + "…";
         pg.update(title, 0.02);
-        HttpRequest rq = HttpRequest.newBuilder(URI.create(url)).header("User-Agent", "PaxLauncher/1.0")
-                .timeout(Duration.ofMinutes(10)).build();
-        HttpResponse<java.io.InputStream> resp = http.send(rq, HttpResponse.BodyHandlers.ofInputStream());
-        try (java.io.InputStream in = resp.body()) {
-            if (resp.statusCode() != 200) throw new IOException("HTTP " + resp.statusCode() + " — Java " + n);
-            long total = resp.headers().firstValueAsLong("Content-Length").orElse(-1);
-            try (java.io.OutputStream out = Files.newOutputStream(part)) {
-                byte[] buf = new byte[65536];
-                long done = 0;
-                int k;
-                while ((k = in.read(buf)) > 0) {
-                    if (stop) throw new Cancelled();
-                    waitPause(() -> stop);
-                    out.write(buf, 0, k);
-                    done += k;
-                    if (total > 0) pg.update(title, 0.9 * done / total);
+        Exception lastErr = null;
+        boolean got = false;
+        for (int t = 0; t < 8 && !got; t++) {
+            if (stop) { Files.deleteIfExists(part); throw new Cancelled(); }
+            if (t > 0) { try { Thread.sleep(Math.min(5000L, 800L * t)); } catch (InterruptedException ie) { throw new Cancelled(); } }
+            try {
+                long have0 = Files.exists(part) ? Files.size(part) : 0;
+                HttpRequest.Builder rb = HttpRequest.newBuilder(URI.create(url)).header("User-Agent", "PaxLauncher/1.0")
+                        .timeout(Duration.ofMinutes(10));
+                if (have0 > 0) rb.header("Range", "bytes=" + have0 + "-");
+                HttpResponse<java.io.InputStream> resp = http.send(rb.build(), HttpResponse.BodyHandlers.ofInputStream());
+                try (java.io.InputStream in = resp.body()) {
+                    int sc = resp.statusCode();
+                    if (sc != 200 && sc != 206) {
+                        if (sc == 416) Files.deleteIfExists(part);
+                        throw new IOException("HTTP " + sc + " — Java " + n);
+                    }
+                    boolean append = sc == 206 && have0 > 0;
+                    long done = append ? have0 : 0;
+                    long total = resp.headers().firstValueAsLong("Content-Length").orElse(-1);
+                    if (total > 0 && append) total += have0;
+                    java.nio.file.OpenOption[] oo = append
+                            ? new java.nio.file.OpenOption[]{java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND}
+                            : new java.nio.file.OpenOption[]{java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.TRUNCATE_EXISTING, java.nio.file.StandardOpenOption.WRITE};
+                    try (java.io.OutputStream out = Files.newOutputStream(part, oo)) {
+                        byte[] buf = new byte[65536];
+                        int k;
+                        while ((k = in.read(buf)) > 0) {
+                            if (stop) throw new Cancelled();
+                            waitPause(() -> stop);
+                            out.write(buf, 0, k);
+                            done += k;
+                            if (total > 0) pg.update(title, 0.9 * done / total);
+                        }
+                    }
                 }
+                got = true;
+            } catch (Cancelled c) {
+                Files.deleteIfExists(part);
+                throw c;
+            } catch (Exception ex) {
+                lastErr = ex;
             }
-        } catch (Exception e) {
+        }
+        if (!got) {
             Files.deleteIfExists(part);
-            throw e;
+            throw new IOException(I18n.t("З'єднання обірвалось під час завантаження Java. Перевір інтернет і спробуй ще раз.") + "\n" + lastErr);
         }
         if (!digest(part, "SHA-256").equalsIgnoreCase(sum)) {
             Files.deleteIfExists(part);
@@ -628,7 +657,12 @@ final class Engine {
 
         pg.update(I18n.t("Встановлення ") + loader + I18n.t(" (це може зайняти кілька хвилин)…"), 0.45);
         Set<String> before = new HashSet<>(installedIds());
-        String java = javaPath.isEmpty() ? autoJava(0) : javaPath;
+        String java = javaPath;
+        if (java.isEmpty()) {
+            int need = 0;
+            try { Object nv = g(v, "javaVersion", "majorVersion"); if (nv instanceof Number) need = ((Number) nv).intValue(); } catch (Exception ignored) { }
+            java = autoJava(need);
+        }
         Process pr = new ProcessBuilder(java, "-jar", inst.toString(), "--installClient", root.toString())
                 .directory(root.toFile()).redirectErrorStream(true).start();
         proc = pr;
@@ -650,7 +684,6 @@ final class Engine {
         throw new IOException(I18n.t("Встановлювач відпрацював, але нову версію не знайдено в ") + root.resolve("versions"));
     }
 
-    /** Контрольна сума з maven-репозиторію (.sha256, інакше .sha1). Без неї файл не запускаємо. */
     String remoteHash(String url) throws IOException {
         for (String ext : new String[]{".sha256", ".sha1"}) {
             try {
@@ -663,7 +696,6 @@ final class Engine {
         throw new IOException(I18n.t("Не вдалося отримати контрольну суму встановлювача — відмовляюсь запускати неперевірений файл."));
     }
 
-    /** Для бібліотек без хешу в описі (Fabric/Quilt): пробуємо взяти .sha1 з того ж maven. */
     private String guessSha1(String url, Path dest) {
         try { if (Files.isRegularFile(dest) && Files.size(dest) > 0) return null; } catch (IOException ignored) { }
         try {
@@ -675,7 +707,6 @@ final class Engine {
         return null;
     }
 
-    /** pin — необов'язкова очікувана SHA-256 (authlibSha256 у launcher.properties): якщо задана, інше не завантажуємо. */
     Path authlib(String pin) throws Exception {
         String want = pin == null ? "" : pin.trim().toLowerCase(Locale.ROOT);
         if (!want.isEmpty() && !want.matches("[0-9a-f]{64}"))

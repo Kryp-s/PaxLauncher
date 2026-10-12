@@ -224,7 +224,6 @@ final class Art {
 
     private static final java.awt.image.BufferedImage[] HOLD = new java.awt.image.BufferedImage[DATA.length];
 
-    // Розкодовує всі вбудовані зображення у фоні одразу після запуску, щоб перший показ не підвисав.
     static void preload() {
         Thread t = new Thread(() -> { for (int i = 0; i < DATA.length; i++) get(i); }, "art-preload");
         t.setDaemon(true);

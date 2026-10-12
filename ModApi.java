@@ -264,7 +264,7 @@ final class ModApi {
                 java.util.zip.ZipEntry e = z.getEntry(name);
                 if (e == null || e.isDirectory() || e.getSize() > 8_000_000) continue;
                 try (InputStream in = z.getInputStream(e)) {
-                    byte[] data = in.readNBytes(8_000_001);   // розмір у zip можна підробити — міряємо по факту
+                    byte[] data = in.readNBytes(8_000_001);
                     if (data.length > 8_000_000) continue;
                     BufferedImage im = readImage(data);
                     if (im != null) return im;
@@ -318,7 +318,6 @@ final class ModApi {
         return sb.toString();
     }
 
-    // Переклади описів зберігаються на диску, тож після перезапуску список одразу з готовими українськими описами.
     private synchronized void loadTranslations() {
         if (trLoaded) return;
         trLoaded = true;
@@ -366,7 +365,6 @@ final class ModApi {
         return c != null ? c : text;
     }
 
-    /** Переклад описів надсилає тексти до Google — лише з явної згоди користувача (налаштування). */
     static volatile boolean translateOn;
 
     boolean needsTranslation(String text) {
@@ -432,8 +430,6 @@ final class ModApi {
         }
     }
 
-    // Кеш пошуку на 20 хвилин + спільний запит: якщо результат уже завантажується (наприклад, наперед), чекаємо на нього,
-    // а не робимо другий запит. Відкриття вкладки «Моди» після створення збірки стає майже миттєвим.
     private final Map<String, java.util.concurrent.CompletableFuture<List<Hit>>> searchCache = new ConcurrentHashMap<>();
     private final Map<String, Long> searchTime = new ConcurrentHashMap<>();
 
@@ -453,13 +449,13 @@ final class ModApi {
             catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) { return searchNet(kind, q, mc, loader, offset); }
         }
         boolean first = offset == 0 && q.isEmpty();
-        if (first) {   // кеш на диску: перша сторінка відкривається миттєво навіть після перезапуску запускача
+        if (first) {
             long[] age = new long[1];
             List<Hit> d = diskLoad(kind, key, age);
             if (d != null) {
                 searchTime.put(key, System.currentTimeMillis());
                 mine.complete(d);
-                if (age[0] > 6 * 3600_000L) {   // застарілий — тихо оновлюємо для наступного разу
+                if (age[0] > 6 * 3600_000L) {
                     Thread t = new Thread(() -> {
                         try {
                             List<Hit> fresh = searchNet(kind, q, mc, loader, 0);
@@ -540,7 +536,6 @@ final class ModApi {
         } catch (Throwable e) { return null; }
     }
 
-    // Прогріває з'єднання з Modrinth (TLS), щоб перший справжній запит не чекав на рукостискання.
     void warm() {
         try { get(MR + "/"); } catch (Throwable ignored) { }
     }
@@ -601,7 +596,6 @@ final class ModApi {
         return out;
     }
 
-    /** Модрінт віддає sha512 і sha1: беремо сильніший (поле ModFile.sha1 тепер може містити sha512). */
     private static String bestHash(Map<String, Object> h) {
         if (h == null) return null;
         String x = s(h.get("sha512"));
@@ -685,7 +679,6 @@ final class ModApi {
         return s;
     }
 
-    /** Файл рівно в папці dir (без «..», підпапок і абсолютних шляхів). */
     static Path child(Path dir, String name) throws IOException {
         Path d = dir.toAbsolutePath().normalize();
         Path p = d.resolve(name).normalize();
@@ -693,7 +686,6 @@ final class ModApi {
         return p;
     }
 
-    /** Читає картинку, відмовляючись від «бомб»: ліміт на кількість пікселів до декодування. */
     static BufferedImage readImage(byte[] data) {
         if (data == null || data.length == 0) return null;
         try (javax.imageio.stream.ImageInputStream is = javax.imageio.ImageIO.createImageInputStream(new ByteArrayInputStream(data))) {
@@ -722,7 +714,7 @@ final class ModApi {
         Files.createDirectories(dir);
         Properties reg = loadReg(dir);
         String old = reg.getProperty(key);
-        if (old != null) { try { child(dir, old); } catch (IOException bad) { old = null; } }   // реєстр лежить у папці гри — йому не довіряємо
+        if (old != null) { try { child(dir, old); } catch (IOException bad) { old = null; } }
         if (isDep && old != null && (Files.exists(dir.resolve(old)) || Files.exists(dir.resolve(old + ".disabled")))) return;
         if (f.url() == null) throw new IOException(I18n.t("Автор заборонив завантаження сторонніми запускачами — візьми файл на сайті."));
         if (f.sha1() == null) throw new IOException(I18n.t("Немає контрольної суми файлу — відмовляюсь завантажувати неперевірений файл."));

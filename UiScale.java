@@ -12,7 +12,7 @@ final class UiScale {
     static double pick(int w, int h) {
         double s = Math.min(w / 1240.0, h / 780.0);
         if (s < 1.08) return 1.0;
-        s = 1 + (s - 1) * 0.5;   // інтерфейс росте приблизно вдвічі повільніше за вікно (раніше — майже 1:1)
+        s = 1 + (s - 1) * 0.5;
         s = Math.min(1.3, s);
         return Math.round(s * 20) / 20.0;
     }
@@ -22,8 +22,6 @@ final class UiScale {
         walk(root, from, to, true);
     }
 
-    // Для компонентів, створених уже при масштабі `to`: шрифти в них вже збільшені (Theme.font),
-    // а розміри, відступи й проміжки — ще ні. Масштабуємо лише їх, без шрифтів.
     static void layoutOnly(Component root, double to) {
         if (to <= 1.001) return;
         walk(root, 1.0, to, false);

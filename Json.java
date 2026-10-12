@@ -37,7 +37,6 @@ final class Json {
 
     private Json(String s) { this.s = s; }
 
-    /** Кидає IllegalArgumentException (а не StackOverflowError / IndexOutOfBounds) на битому чи надто глибокому JSON. */
     static Object parse(String text) {
         try {
             return new Json(text).val();

@@ -5,16 +5,9 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.util.*;
 import java.util.concurrent.*;
 
-/**
- * Захист токенів у файлі акаунтів.
- * Windows: шифрування через DPAPI (ключ прив'язаний до користувача Windows) — файл не можна розшифрувати
- * ні на іншому ПК, ні під іншим користувачем.
- * Linux/macOS: звичайний текст, але з правами лише для власника (rw-------).
- * Якщо PowerShell недоступний або заблокований — запасний варіант: текст (як було раніше), без втрати акаунтів.
- */
 final class Vault {
     static final String PREFIX = "dpapi:";
-    private static final Map<String, String> cache = new ConcurrentHashMap<>(); // відкритий текст -> "dpapi:..."
+    private static final Map<String, String> cache = new ConcurrentHashMap<>();
 
     private static boolean win() { return System.getProperty("os.name", "").toLowerCase().contains("win"); }
 
@@ -34,7 +27,6 @@ final class Vault {
                 + "[Console]::Out.WriteLine([Convert]::ToBase64String($r))}catch{[Console]::Out.WriteLine('ERR')}}";
     }
 
-    /** По одному рядку base64 на вхід -> по одному рядку на вихід. null, якщо PowerShell не спрацював. */
     private static List<String> run(String mode, List<String> lines) {
         if (!win() || lines.isEmpty()) return null;
         try {
@@ -56,7 +48,6 @@ final class Vault {
         } catch (Exception e) { return null; }
     }
 
-    /** Абсолютний шлях до системного PowerShell, щоб не залежати від PATH (підміна powershell.exe). */
     private static String powershell() {
         String root = System.getenv("SystemRoot");
         if (root != null && !root.isEmpty()) {
@@ -67,11 +58,9 @@ final class Vault {
     }
 
     private static volatile boolean warned;
-    /** true, якщо токени довелось зберегти без шифрування (DPAPI/PowerShell недоступні). */
     static volatile boolean insecure;
     static volatile Runnable onInsecure;
 
-    /** Атомарний запис .properties: пишемо у .tmp (на Linux/macOS одразу з правами rw-------), потім переносимо. */
     static void writeProps(Path file, Properties p, String comment, boolean secret) throws IOException {
         Files.createDirectories(file.getParent());
         if (secret && !win()) restrictDir(file.getParent());
@@ -86,7 +75,6 @@ final class Vault {
         catch (AtomicMoveNotSupportedException e) { Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING); }
     }
 
-    /** Розшифровує у пам'яті всі значення "dpapi:...". Що не вдалось — лишається як є (не губимо дані). */
     static void decryptAll(Properties p) {
         List<String> keys = new ArrayList<>(), lines = new ArrayList<>();
         for (String k : p.stringPropertyNames()) {
@@ -113,7 +101,6 @@ final class Vault {
         return false;
     }
 
-    /** Замінює відкриті токени в копії для запису на диск. Якщо шифрування недоступне — лишає як є. */
     static void encryptAll(Properties out) {
         List<String> keys = new ArrayList<>(), lines = new ArrayList<>();
         for (String k : out.stringPropertyNames()) {
@@ -144,13 +131,11 @@ final class Vault {
         }
     }
 
-    /** Linux/macOS: тека лише для власника (rwx------). */
     static void restrictDir(Path d) {
         try { Files.setPosixFilePermissions(d, PosixFilePermissions.fromString("rwx------")); }
         catch (UnsupportedOperationException | IOException ignored) { }
     }
 
-    /** Linux/macOS: права тільки для власника. На Windows нічого не робить. */
     static void restrict(Path f) {
         try { Files.setPosixFilePermissions(f, PosixFilePermissions.fromString("rw-------")); }
         catch (UnsupportedOperationException | IOException ignored) { }

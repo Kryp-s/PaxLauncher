@@ -60,7 +60,6 @@ public class PaxLauncher {
         return now;
     }
 
-    /** Помилки, які раніше глухли: пишемо у error.log (до 100 КБ) у папці запускача. */
     static void warn(String msg, Throwable t) {
         try {
             Files.createDirectories(ROOT);
@@ -73,7 +72,6 @@ public class PaxLauncher {
 
     private static java.nio.channels.FileChannel lockCh;
 
-    /** Один запускач на користувача: два екземпляри псують спільні launcher.properties / accounts. */
     static boolean singleInstance() {
         try {
             Files.createDirectories(ROOT);
@@ -143,7 +141,6 @@ public class PaxLauncher {
                 }
             }
             String st = new java.math.BigInteger(1, md.digest()).toString(16) + ":" + Runtime.version();
-            // кеш-jar виконується при кожному старті: перевіряємо вміст і джерел, і самого jar, а не лише дату
             if (Files.isRegularFile(jar) && Files.isRegularFile(stamp)) {
                 String[] sl = Files.readString(stamp).split("\n", 2);
                 if (sl.length == 2 && sl[0].equals(st) && sl[1].trim().equalsIgnoreCase(Engine.digest(jar, "SHA-256"))) return jar;

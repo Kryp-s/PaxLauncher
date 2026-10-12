@@ -34,7 +34,7 @@ final class ColorPick extends JComponent {
     private float h, s, v;
     private int drag;
     private final Rectangle sv = new Rectangle(0, 0, 280, 170), hb = new Rectangle(0, 184, 280, 16);
-    private static final int HPAD = 8;   // повзунок відтінку повністю всередині смуги
+    private static final int HPAD = 8;
     Consumer<Color> onChange;
 
     ColorPick(Color c) {
@@ -84,8 +84,6 @@ final class ColorPick extends JComponent {
         g.fill(sv);
         g.setPaint(new GradientPaint(0, sv.y, new Color(0, 0, 0, 0), 0, sv.y + sv.height, Color.BLACK));
         g.fill(sv);
-        // Кружок малюємо лише всередині області, яку компонент повністю перезафарбовує на кожному кадрі.
-        // Інакше біля країв (вікно напівпрозоре, фон не очищується) лишаються «клони» кружка.
         int kx = sv.x + Math.round(s * sv.width), ky = sv.y + Math.round((1f - v) * sv.height);
         g.setStroke(new BasicStroke(2f));
         g.setColor(new Color(0, 0, 0, 110));

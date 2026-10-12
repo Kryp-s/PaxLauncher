@@ -32,6 +32,7 @@ import javax.swing.plaf.basic.*;
 
 final class Combo<T> extends JComboBox<T> {
     boolean iconed;
+    String placeholder;
     boolean wideList;
 
     void refreshTheme() {
@@ -51,14 +52,15 @@ final class Combo<T> extends JComboBox<T> {
             private String sub = "";
 
             @Override public Component getListCellRendererComponent(JList<?> l, Object v, int i, boolean sel, boolean foc) {
-                String full = v == null ? "" : String.valueOf(v), main = full;
+                boolean ph = v == null && i < 0 && placeholder != null;
+                String full = v == null ? (ph ? placeholder : "") : String.valueOf(v), main = full;
                 sub = "";
                 int k = full.indexOf("  · ");
                 if (k >= 0) { main = full.substring(0, k); sub = full.substring(k + 4); }
                 super.getListCellRendererComponent(l, main, i, sel, false);
                 setOpaque(true);
                 setBackground(sel ? Theme.SEL : Theme.CARD2);
-                setForeground(Theme.TEXT);
+                setForeground(ph ? Theme.MUTED : Theme.TEXT);
                 setFont(Theme.font(Font.PLAIN, 14));
                 setBorder(new EmptyBorder(8, 14, 8, 14));
                 return this;
@@ -125,7 +127,19 @@ final class Combo<T> extends JComboBox<T> {
 
         @Override public void paintCurrentValue(Graphics g, Rectangle r, boolean hasFocus) {
             Object v = comboBox.getSelectedItem();
-            if (v == null) return;
+            if (v == null) {
+                String ph = ((Combo<?>) comboBox).placeholder;
+                if (ph == null || ph.isEmpty()) return;
+                Graphics2D gp = (Graphics2D) g.create();
+                Theme.aa(gp);
+                gp.clipRect(r.x, r.y, r.width, r.height);
+                gp.setFont(comboBox.getFont());
+                gp.setColor(Theme.MUTED);
+                FontMetrics pm = gp.getFontMetrics();
+                gp.drawString(ph, r.x + 12, r.y + (r.height - pm.getHeight()) / 2 + pm.getAscent());
+                gp.dispose();
+                return;
+            }
             Graphics2D g2 = (Graphics2D) g.create();
             Theme.aa(g2);
             g2.clipRect(r.x, r.y, r.width, r.height);
