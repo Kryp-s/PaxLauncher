@@ -87,8 +87,14 @@ final class NewsPanel extends JPanel {
             Set<String> seen = new HashSet<>();
             for (String feed : feeds) {
                 try {
-                    String body = http.send(HttpRequest.newBuilder(URI.create(feed))
-                            .header("User-Agent", "PaxLauncher/1.0").timeout(Duration.ofSeconds(15)).build(), HttpResponse.BodyHandlers.ofString()).body();
+                    HttpResponse<java.io.InputStream> fr = http.send(HttpRequest.newBuilder(URI.create(feed))
+                            .header("User-Agent", "PaxLauncher/1.0").timeout(Duration.ofSeconds(15)).build(), HttpResponse.BodyHandlers.ofInputStream());
+                    String body;
+                    try (java.io.InputStream fin = fr.body()) {
+                        byte[] fb = fin.readNBytes(5_000_001);
+                        if (fr.statusCode() != 200 || fb.length > 5_000_000) continue;
+                        body = new String(fb, StandardCharsets.UTF_8);
+                    }
                     for (Object e : Json.list(Json.map(Json.parse(body)).get("entries"))) {
                         String u = Json.string(Json.get(e, "newsPageImage", "url"));
                         if (u == null) u = Json.string(Json.get(e, "playPageImage", "url"));
@@ -105,9 +111,16 @@ final class NewsPanel extends JPanel {
             for (Raw r : raws) {
                 if (out.size() >= 4) break;
                 try {
-                    byte[] bytes = http.send(HttpRequest.newBuilder(base.resolve(r.img())).header("User-Agent", "PaxLauncher/1.0")
-                            .timeout(Duration.ofSeconds(30)).build(), HttpResponse.BodyHandlers.ofByteArray()).body();
-                    BufferedImage im = javax.imageio.ImageIO.read(new ByteArrayInputStream(bytes));
+                    URI iu = base.resolve(r.img());
+                    String ih = iu.getHost() == null ? "" : iu.getHost().toLowerCase(java.util.Locale.ROOT);
+                    if (!"https".equalsIgnoreCase(iu.getScheme())
+                            || !(ih.equals("mojang.com") || ih.endsWith(".mojang.com") || ih.equals("minecraft.net") || ih.endsWith(".minecraft.net"))) continue;
+                    HttpResponse<java.io.InputStream> ir = http.send(HttpRequest.newBuilder(iu).header("User-Agent", "PaxLauncher/1.0")
+                            .timeout(Duration.ofSeconds(30)).build(), HttpResponse.BodyHandlers.ofInputStream());
+                    byte[] bytes;
+                    try (java.io.InputStream iin = ir.body()) { bytes = iin.readNBytes(5_000_001); }
+                    if (ir.statusCode() != 200 || bytes.length > 5_000_000) continue;
+                    BufferedImage im = ModApi.readImage(bytes);
                     if (im == null) continue;
                     out.add(new Item(r.title(), r.text(), r.date().substring(0, Math.min(10, r.date().length())), r.link(), scaleTo(im, 520)));
                 } catch (Exception ignored) { }
@@ -135,7 +148,7 @@ final class NewsPanel extends JPanel {
                 @Override public void mouseExited(MouseEvent e) { fx.hover(false); }
                 @Override public void mouseClicked(MouseEvent e) {
                     try {
-                        if (it.link() != null && Desktop.isDesktopSupported()) Desktop.getDesktop().browse(URI.create(it.link()));
+                        if (it.link() != null && it.link().startsWith("https://") && Desktop.isDesktopSupported()) Desktop.getDesktop().browse(URI.create(it.link()));
                     } catch (Exception ignored) { }
                 }
             });

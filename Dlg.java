@@ -81,12 +81,14 @@ final class Dlg {
             }
         });
 
+        UiScale.layoutOnly(root, Theme.S);
         d.setContentPane(root);
         d.getRootPane().setDefaultButton(okB);
         d.getRootPane().registerKeyboardAction(e -> d.dispose(),
                 KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), JComponent.WHEN_IN_FOCUSED_WINDOW);
         d.pack();
-        if (d.getWidth() < 420) d.setSize(420, d.getHeight());
+        int minW = (int) Math.round(420 * Theme.S);
+        if (d.getWidth() < minW) d.setSize(minW, d.getHeight());
         d.setLocationRelativeTo(owner);
         if (ready != null) ready.accept(d);
         d.setVisible(true);

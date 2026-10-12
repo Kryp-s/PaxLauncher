@@ -8,7 +8,6 @@ import java.awt.image.BufferedImage;
 import java.io.*;
 import java.lang.management.ManagementFactory;
 import java.net.URI;
-import java.net.URLEncoder;
 import java.net.http.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
@@ -75,6 +74,12 @@ final class LauncherWindow extends JFrame {
     final JavaFinder.Inst javaAuto = new JavaFinder.Inst(I18n.t("Автоматично (під версію гри)"), "");
     final JavaFinder.Inst javaCustom = new JavaFinder.Inst(I18n.t("Свій шлях…"), null);
     boolean javaSync;
+    static final int[][] RES_PRESETS = {{1280, 720}, {1366, 768}, {1600, 900}, {1920, 1080}, {2560, 1440}};
+    final Combo<String> resC = new Combo<>();
+    final JLabel resHint = label(" ", 12, false, Theme.MUTED);
+    boolean resSync;
+    String pendLang;      // мова, обрана в налаштуваннях, але ще не збережена
+    boolean themeDirty;   // тема/колір показані для перегляду, але ще не збережені
     final Field javaF = new Field(""), jvmF = new Field(""), wF = new Field(""), hF = new Field(""), dirF = new Field("");
     final JSlider ram = new JSlider(2, 32, 8);
     final JLabel ramLbl = label("4096 MB", 14, true, Theme.TEXT);
@@ -162,7 +167,29 @@ final class LauncherWindow extends JFrame {
     final JLabel mStatus = label(I18n.t("Створи збірку і шукай моди"), 13, false, Theme.MUTED);
     final Bar mBar = new Bar();
     final DefaultListModel<ModApi.Hit> mModel = new DefaultListModel<>();
-    final JList<ModApi.Hit> mList = new JList<>(mModel);
+    volatile boolean mLoading;
+    final javax.swing.Timer mPulse = new javax.swing.Timer(60, null);
+    final JList<ModApi.Hit> mList = new JList<ModApi.Hit>(mModel) {
+        // Поки результати вантажаться — замість порожнього блоку малюємо «скелетон» (сірі рядки, що мерехтять).
+        @Override protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            if (!mLoading || !mModel.isEmpty()) return;
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            double ph = (System.nanoTime() / 1_000_000 % 1400) / 1400.0;
+            int rows = Math.max(1, getHeight() / 58 + 1);
+            for (int i = 0; i < rows; i++) {
+                double w = 0.5 + 0.5 * Math.sin((ph - i * 0.08) * Math.PI * 2);
+                float a = (float) (0.10 + 0.10 * w);
+                int y = i * 58 + 9;
+                g2.setColor(new Color(1f, 1f, 1f, a));
+                g2.fillRoundRect(12, y, 40, 40, 12, 12);
+                g2.fillRoundRect(64, y + 5, Math.max(40, (int) (getWidth() * (i % 3 == 0 ? 0.50 : i % 3 == 1 ? 0.38 : 0.56))), 12, 8, 8);
+                g2.fillRoundRect(64, y + 25, Math.max(40, (int) (getWidth() * (i % 2 == 0 ? 0.68 : 0.58))), 10, 8, 8);
+            }
+            g2.dispose();
+        }
+    };
     final JLabel dTitle = label(I18n.t("Обери мод зі списку"), 18, true, Theme.TEXT);
     final JLabel dMeta = label(" ", 12, false, Theme.MUTED);
     final JTextArea dDesc = new JTextArea();
@@ -186,7 +213,55 @@ final class LauncherWindow extends JFrame {
     final AtomicInteger mSeq = new AtomicInteger(), mfSeq = new AtomicInteger();
     boolean mFilling, mBusy, mInstalledView;
 
+    volatile ModApi.Kind kindNow = ModApi.Kind.MOD;
+
+    // Завантажує наперед першу сторінку (разом з іконками й перекладом опису) для всіх типів — моди, набори ресурсів, шейдери,
+    // щоб після створення збірки вкладка одразу показувала готовий список, а не порожній блок.
+    void prefetchMods(String mcv, String loader) {
+        if (mcv == null || loader == null) return;
+        for (ModApi.Kind k : ModApi.Kind.values()) {
+            if (k.isMod() && loader.equals("Vanilla")) continue;
+            Thread t = new Thread(() -> {
+                try { warmHits(api.search(k, "", mcv, loader, 0), 8000); } catch (Throwable ignored) { }
+            }, "mods-prefetch-" + k.type);
+            t.setDaemon(true);
+            t.start();
+        }
+    }
+
+    // Підтягує іконки, переклад опису та деталі перших результатів, щоб вони з'явились у списку одразу, а не по одному.
+    void warmHits(List<ModApi.Hit> hs, long maxMs) {
+        if (hs == null || hs.isEmpty()) return;
+        long end = System.currentTimeMillis() + maxMs;
+        List<Future<?>> fs = new ArrayList<>();
+        int n = Math.min(hs.size(), 12);
+        for (int i = 0; i < n; i++) {
+            ModApi.Hit h = hs.get(i);
+            final boolean head = i == 0;
+            String u = h.iconUrl();
+            if (u != null && !u.isEmpty() && !iconRaw.containsKey(u))
+                fs.add(iconPool.submit(() -> {
+                    if (iconRaw.containsKey(u)) return;
+                    BufferedImage im = fetchProjectIcon(u);
+                    if (im != null) iconRaw.put(u, im);
+                }));
+            if (api.needsTranslation(h.desc())) fs.add(iconPool.submit(() -> { api.translate(h.desc()); }));
+            if (head) fs.add(iconPool.submit(() -> {
+                try {
+                    ModApi.Detail pd = api.project(h.id());
+                    if (pd != null) tr(ModApi.excerpt(pd.body(), 1200));
+                } catch (Throwable ignored) { }
+            }));
+        }
+        for (Future<?> f : fs) {
+            long left = end - System.currentTimeMillis();
+            if (left <= 0) break;
+            try { f.get(left, TimeUnit.MILLISECONDS); } catch (Throwable ignored) { }
+        }
+    }
+
     LauncherWindow() {
+        Art.preload();
         setTitle("PaxLauncher");
         setIconImage(Theme.icon(64));
         setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
@@ -221,13 +296,25 @@ final class LauncherWindow extends JFrame {
         bg.add(rootPanel, BorderLayout.CENTER);
 
         loadSettings();
-        online.start();
         rpc.configure(discC.isSelected() ? discF.getText().trim() : "");
         presenceIdle();
         showPage("play");
         refreshVersions();
         if (accounts.current() != null) enterApp(); else showLogin();
         log(I18n.t("Папка запускача: ") + root);
+        live = this;
+        Thread pre = new Thread(() -> {   // фоновий прогрів Modrinth + перша сторінка модів поточної збірки
+            try {
+                api.warm();
+                List<Prof> ps = loadProfiles();
+                String want = cfg.get("modProfile", "");
+                Prof pick = ps.isEmpty() ? null : ps.get(0);
+                for (Prof q : ps) if (q.name().equals(want)) pick = q;
+                if (pick != null) prefetchMods(pick.mc(), pick.loader());
+            } catch (Throwable ignored) { }
+        }, "mods-warm");
+        pre.setDaemon(true);
+        pre.start();
     }
 
     static JLabel label(String text, int size, boolean bold, Color c) {
@@ -281,6 +368,7 @@ final class LauncherWindow extends JFrame {
         warm.start();
     }
 
+    static volatile LauncherWindow live;
     final DiscordRpc rpc = new DiscordRpc(this::log);
     final long launcherStart = System.currentTimeMillis() / 1000;
     Backdrop bg;
@@ -294,10 +382,7 @@ final class LauncherWindow extends JFrame {
     final List<String> hist = new ArrayList<>();
     int hpos = -1;
     boolean navigating;
-    final Check discC = new Check(I18n.t("Показувати гру в Discord"), true);
-    final Check onlineC = new Check(I18n.t("Враховувати мене в лічильнику онлайну"), true);
-    final OnlineBadge onlineBadge = new OnlineBadge();
-    final Online online = new Online(cfg, () -> onlineC.isSelected(), onlineBadge::set);
+    final Check discC = new Check(I18n.t("Показувати гру в Discord"), false);
     final JLabel playerLbl = label("—", 15, true, Theme.TEXT);
 
     private javax.swing.Timer maxAnim;
@@ -634,6 +719,13 @@ final class LauncherWindow extends JFrame {
     }
 
     void showPage(String key) {
+        if (!key.equals("settings") && curPage.equals("settings")) {
+            // вийшли з налаштувань без «Зберегти» — незбережені зміни скасовуються
+            if (themeDirty) revertTheme();
+            reloadSettingsForm();
+            pendLang = null;
+            buildLangControls();
+        }
         pages.change(() -> cards.show(pages, key));
         curPage = key;
         if (!inGame) presenceIdle();
@@ -653,13 +745,7 @@ final class LauncherWindow extends JFrame {
     }
 
     void exit() {
-        try { saveSettings(); } catch (Throwable ignored) { }
-        try {
-            Thread bt = new Thread(online::bye, "online-bye");
-            bt.setDaemon(true);
-            bt.start();
-            bt.join(800);
-        } catch (Throwable ignored) { }
+        try { saveVersion(); } catch (Throwable ignored) { }
         try { dispose(); } catch (Throwable ignored) { }
         Thread w = new Thread(() -> {
             try { Thread.sleep(2500); } catch (InterruptedException ignored) { }
@@ -896,7 +982,6 @@ final class LauncherWindow extends JFrame {
 
         rp.row(header(I18n.t("Новини Minecraft")), 26);
         rp.row(new NewsPanel(), 12);
-        if (Online.configured()) rp.row(onlineBadge, 4);
         rp.end();
 
         JScrollPane sp = vscroll(rp, Theme.SIDE);
@@ -929,7 +1014,7 @@ final class LauncherWindow extends JFrame {
         versions.iconed = true;
         versions.setPreferredSize(new Dimension(280, 58));
         jump.add(versions, g);
-        playBtn.setFont(Theme.font(Font.BOLD, 17));
+        playBtn.setFont(Theme.bfont(Font.BOLD, 17));
         playBtn.setPreferredSize(new Dimension(170, 58));
         playBtn.setMinimumSize(new Dimension(170, 58));
         g.gridx = 1; g.weightx = 0; g.insets = new Insets(0, 14, 0, 0);
@@ -1028,28 +1113,39 @@ final class LauncherWindow extends JFrame {
         int sel = 0;
         for (int i = 0; i < I18n.LANGS.length; i++) {
             cb.addItem(I18n.LANGS[i][1]);
-            if (I18n.LANGS[i][0].equals(I18n.code())) sel = i;
+            if (I18n.LANGS[i][0].equals(pendLang != null ? pendLang : I18n.code())) sel = i;
         }
         cb.setSelectedIndex(sel);
         cb.setPreferredSize(new Dimension(220, 40));
         cb.addActionListener(e -> {
             int i = cb.getSelectedIndex();
-            if (i >= 0) chooseLang(I18n.LANGS[i][0]);
+            if (i >= 0) pendLang = I18n.norm(I18n.LANGS[i][0]);
         });
         langP.add(cb);
         langP.revalidate();
         langP.repaint();
     }
 
-    void chooseLang(String code) {
-        if (cfg.get("lang", "uk").equals(code)) return;
+    // Усі підписи створюються разом з вікном, тож мова змінюється перебудовою вікна на тому ж місці:
+    // розмір, розгорнутість, відкрита сторінка й журнал консолі лишаються як були.
+    void switchLanguage(String code) {
+        try { saveSettings(); } catch (Throwable ignored) { }
         cfg.set("lang", code);
         cfg.save();
-        if (code.equals(I18n.code())) return;
-        String name = I18n.nameOf(code);
-        String now = I18n.restartNote(I18n.code(), name);
-        String next = I18n.restartNote(code, name);
-        msg(now.equals(next) ? now : now + "\n\n" + next);
+        final boolean wasMax = maxed;
+        final Rectangle nb = wasMax && restoreBounds != null ? new Rectangle(restoreBounds) : getBounds();
+        final String page = curPage, logText = console.getText();
+        I18n.init(code);
+        Theme.setScale(1.0);
+        LauncherWindow nw = new LauncherWindow();
+        nw.setBounds(nb);
+        nw.console.setText(logText);
+        nw.console.setCaretPosition(nw.console.getDocument().getLength());
+        nw.showPage(page);
+        nw.setVisible(true);
+        if (wasMax) SwingUtilities.invokeLater(nw::toggleMaxPlain);
+        rpc.shutdown();
+        dispose();
     }
 
     void buildThemeControls() {
@@ -1061,13 +1157,13 @@ final class LauncherWindow extends JFrame {
         themeColorP.removeAll();
         Btn dk = small(new Btn(I18n.t("Темна"), Theme.light ? Btn.Kind.SECONDARY : Btn.Kind.PRIMARY));
         Btn lt = small(new Btn(I18n.t("Світла"), Theme.light ? Btn.Kind.PRIMARY : Btn.Kind.SECONDARY));
-        dk.addActionListener(e -> { if (Theme.light) changeTheme(false, Theme.accent); });
-        lt.addActionListener(e -> { if (!Theme.light) changeTheme(true, Theme.accent); });
+        dk.addActionListener(e -> { if (Theme.light) previewTheme(false, Theme.accent); });
+        lt.addActionListener(e -> { if (!Theme.light) previewTheme(true, Theme.accent); });
         themeModeP.add(dk);
         themeModeP.add(lt);
         for (int rgb : PRESETS) {
             Color c = new Color(rgb);
-            themeColorP.add(new Swatch(c, () -> changeTheme(Theme.light, c)));
+            themeColorP.add(new Swatch(c, () -> previewTheme(Theme.light, c)));
         }
         Btn custom = small(new Btn(I18n.t("Свій колір…"), Btn.Kind.SECONDARY));
         custom.addActionListener(e -> pickColor());
@@ -1083,16 +1179,31 @@ final class LauncherWindow extends JFrame {
         themeColorP.repaint();
     }
 
-    void changeTheme(boolean light, Color accent) {
+    // Показати тему/колір на всьому лаунчері одразу, але не зберігати до натискання «Зберегти».
+    void previewTheme(boolean light, Color accent) {
+        themeDirty = true;
+        changeTheme(light, accent, false);
+    }
+
+    void revertTheme() {
+        themeDirty = false;
+        changeTheme("light".equals(cfg.get("theme", "dark")), Theme.parseHex(cfg.get("accent", ""), Theme.DEFAULT_ACCENT), false);
+    }
+
+    void changeTheme(boolean light, Color accent) { changeTheme(light, accent, true); }
+
+    void changeTheme(boolean light, Color accent, boolean persist) {
         Color[] old = Theme.palette();
         Theme.apply(light, accent);
         Theme.applyUI();
         Map<Integer, Color> m = Theme.remap(old);
         setBackground(Theme.BG2);
         Theme.recolor(getContentPane(), m);
-        cfg.set("theme", light ? "light" : "dark");
-        cfg.set("accent", String.format("%06X", accent.getRGB() & 0xFFFFFF));
-        cfg.save();
+        if (persist) {
+            cfg.set("theme", light ? "light" : "dark");
+            cfg.set("accent", String.format("%06X", accent.getRGB() & 0xFFFFFF));
+            cfg.save();
+        }
         buildThemeControls();
         revalidate();
         repaint();
@@ -1136,7 +1247,7 @@ final class LauncherWindow extends JFrame {
         box.setOpaque(false);
         box.add(pick, BorderLayout.CENTER);
         box.add(hexRow, BorderLayout.SOUTH);
-        if (Dlg.show(this, I18n.t("Колір теми"), box, I18n.t("Застосувати"), I18n.t("Скасувати"))) changeTheme(Theme.light, pick.get());
+        if (Dlg.show(this, I18n.t("Колір теми"), box, I18n.t("Застосувати"), I18n.t("Скасувати"))) previewTheme(Theme.light, pick.get());
     }
 
     void row(JPanel c, int y, String text, JComponent comp, JComponent extra) {
@@ -1148,6 +1259,8 @@ final class LauncherWindow extends JFrame {
         c.add(l, g);
         g.gridx = 1; g.weightx = 1; g.fill = GridBagConstraints.HORIZONTAL;
         g.insets = new Insets(8, 0, 8, extra != null ? 10 : 0);
+        // ширина колонки не залежить від довжини тексту всередині (шлях Java, підказки) — розкладка статична
+        comp.setPreferredSize(new Dimension(10, comp.getPreferredSize().height));
         c.add(comp, g);
         if (extra != null) {
             g.gridx = 2; g.weightx = 0; g.fill = GridBagConstraints.NONE; g.insets = new Insets(8, 0, 8, 0);
@@ -1164,16 +1277,7 @@ final class LauncherWindow extends JFrame {
         Card c = new Card(new GridBagLayout(), 20);
 
         Btn javaBrowse = new Btn(I18n.t("Огляд"), Btn.Kind.SECONDARY);
-        javaBrowse.addActionListener(e -> {
-            File jStart = null;
-            try {
-                String cur = javaPath();
-                if (!cur.isEmpty() && Path.of(cur).getParent() != null && Files.isDirectory(Path.of(cur).getParent()))
-                    jStart = Path.of(cur).getParent().toFile();
-            } catch (Exception ignored) { }
-            File[] jRes = FilePick.show(this, I18n.t("Обери java (або папку JDK)"), JFileChooser.FILES_AND_DIRECTORIES, false, jStart);
-            if (jRes != null && jRes.length > 0) javaF.setText(jRes[0].getAbsolutePath());
-        });
+        javaBrowse.addActionListener(e -> openFolder(javaRoot()));
         javaC.setPreferredSize(new Dimension(300, 40));
         javaC.wideList = true;
         javaF.setToolTipText(I18n.t("Шлях до java (або до папки JDK). Порожньо — автоматичний вибір Java під версію гри."));
@@ -1204,8 +1308,6 @@ final class LauncherWindow extends JFrame {
             SwingUtilities.invokeLater(() -> fillJava(found));
         }, "java-scan").start();
         row(c, 0, "Java", javaP, javaBrowse);
-        row(c, 1, I18n.t("Додаткові JVM-аргументи"), jvmF, null);
-
         ram.setOpaque(false);
         ram.setUI(new SlimSliderUI(ram));
         long totalMb = totalMemMb();
@@ -1219,19 +1321,39 @@ final class LauncherWindow extends JFrame {
         row(c, 2, I18n.t("Виділена пам'ять (ОЗП)"), ramP, null);
 
         wF.setColumns(6); hF.setColumns(6);
-        JPanel res = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        resC.addItem(I18n.t("Стандартна (авто)"));
+        for (int[] pr : RES_PRESETS) resC.addItem(pr[0] + "×" + pr[1]);
+        resC.addItem(I18n.t("Власна"));
+        resC.setPreferredSize(new Dimension(190, 40));
+        resC.addActionListener(e -> {
+            if (resSync) return;
+            int ri = resC.getSelectedIndex();
+            resSync = true;
+            if (ri == 0) { wF.setText(""); hF.setText(""); }
+            else if (ri >= 1 && ri <= RES_PRESETS.length) {
+                wF.setText(String.valueOf(RES_PRESETS[ri - 1][0]));
+                hF.setText(String.valueOf(RES_PRESETS[ri - 1][1]));
+            }
+            resSync = false;
+            updateResHint();
+        });
+        JPanel resRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        resRow.setOpaque(false);
+        resRow.add(resC);
+        resRow.add(wF);
+        resRow.add(label("×", 16, true, Theme.MUTED));
+        resRow.add(hF);
+        JPanel res = new JPanel(new BorderLayout(0, 6));
         res.setOpaque(false);
-        res.add(wF);
-        res.add(label("×", 16, true, Theme.MUTED));
-        res.add(hF);
+        res.add(resRow, BorderLayout.NORTH);
+        res.add(resHint, BorderLayout.SOUTH);
         row(c, 3, I18n.t("Роздільна здатність вікна"), res, null);
 
         Btn dirBrowse = new Btn(I18n.t("Огляд"), Btn.Kind.SECONDARY);
         dirBrowse.addActionListener(e -> {
-            File dStart = null;
-            try { File cur = new File(dirF.getText().trim()); if (cur.isDirectory()) dStart = cur; } catch (Exception ignored) { }
-            File[] dRes = FilePick.show(this, I18n.t("Ігрова папка (saves, mods)"), JFileChooser.DIRECTORIES_ONLY, false, dStart);
-            if (dRes != null && dRes.length > 0) dirF.setText(dRes[0].getAbsolutePath());
+            Path d = root;
+            try { String t = dirF.getText().trim(); if (!t.isEmpty()) d = Path.of(t); Files.createDirectories(d); } catch (Exception ignored) { }
+            openFolder(d);
         });
         row(c, 4, I18n.t("Ігрова папка (saves, mods)"), dirF, dirBrowse);
 
@@ -1241,35 +1363,44 @@ final class LauncherWindow extends JFrame {
         discC.setBorder(new EmptyBorder(0, 24, 0, 0));
         hideP.add(discC);
         row(c, 8, I18n.t("Поведінка"), hideP, null);
-        if (Online.configured()) {
-            JPanel onlineP = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
-            onlineP.setOpaque(false);
-            onlineP.add(onlineC);
-            row(c, 8, I18n.t("Приватність"), onlineP, null);
-        }
 
         JPanel btns = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 0));
         btns.setOpaque(false);
-        Btn openGame = small(new Btn(I18n.t("Папка гри"), Btn.Kind.SECONDARY));
-        Btn openMods = small(new Btn(I18n.t("Папка модів"), Btn.Kind.SECONDARY));
         Btn save = small(new Btn(I18n.t("Зберегти"), Btn.Kind.PRIMARY));
-        openGame.addActionListener(e -> openFolder(Path.of(dirF.getText().trim().isEmpty() ? root.toString() : dirF.getText().trim())));
-        openMods.addActionListener(e -> openFolder(Path.of(dirF.getText().trim().isEmpty() ? root.toString() : dirF.getText().trim()).resolve("mods")));
+        JLabel saveNote = label(" ", 13, false, Theme.MUTED);
+        javax.swing.Timer noteT = new javax.swing.Timer(3000, e -> saveNote.setText(" "));
+        noteT.setRepeats(false);
         save.addActionListener(e -> {
             saveSettings();
+            updateResHint();
+            themeDirty = false;
+            cfg.set("theme", Theme.light ? "light" : "dark");
+            cfg.set("accent", String.format("%06X", Theme.accent.getRGB() & 0xFFFFFF));
+            cfg.save();
+            if (pendLang != null && !pendLang.equals(I18n.code())) {
+                if (busy || mBusy || inGame) {
+                    msg(I18n.t("Зачекай, поки завершиться завантаження чи гра, — тоді можна змінити мову."));
+                } else {
+                    String nl = pendLang;
+                    pendLang = null;
+                    SwingUtilities.invokeLater(() -> switchLanguage(nl));
+                    return;
+                }
+            }
             String j = javaPath();
             boolean bad = !j.isEmpty() && (j.contains("/") || j.contains("\\")) && !Files.isRegularFile(Path.of(j));
-            status.setText(bad ? I18n.t("Збережено, але файл Java не знайдено: ") + j : I18n.t("Налаштування збережено"));
+            saveNote.setText(bad ? I18n.t("Збережено, але файл Java не знайдено: ") + j : I18n.t("Налаштування збережено"));
+            noteT.restart();
         });
-        btns.add(openGame);
-        btns.add(openMods);
         btns.add(save);
+        btns.add(saveNote);
         buildThemeControls();
         row(c, 9, I18n.t("Тема інтерфейсу"), themeModeP, null);
         row(c, 10, I18n.t("Колір теми"), themeColorP, null);
         buildLangControls();
         row(c, 11, I18n.t("Мова"), langP, null);
         row(c, 12, "", btns, null);
+        wireResSync();
 
         JPanel center = new JPanel(new BorderLayout());
         center.setOpaque(false);
@@ -1330,6 +1461,21 @@ final class LauncherWindow extends JFrame {
         return c;
     }
 
+    // Коренева папка вибраної Java (для «Огляд»); для автоматичного вибору — папка runtime запускача.
+    Path javaRoot() {
+        try {
+            String p = javaPath();
+            if (!p.isEmpty()) {
+                Path exe = Path.of(p);
+                Path dir = exe.getParent();
+                if (dir != null && dir.getFileName() != null && dir.getFileName().toString().equalsIgnoreCase("bin") && dir.getParent() != null) dir = dir.getParent();
+                if (dir != null && Files.isDirectory(dir)) return dir;
+            }
+        } catch (Exception ignored) { }
+        Path rt = root.resolve("runtime");
+        return Files.isDirectory(rt) ? rt : root;
+    }
+
     void fillJava(List<JavaFinder.Inst> found) {
         javaSync = true;
         javaC.removeAllItems();
@@ -1372,10 +1518,17 @@ final class LauncherWindow extends JFrame {
     }
 
     void loadSettings() {
+        reloadSettingsForm();
+        cRel.setSelected(cfg.getb("rel", true));
+        cSnap.setSelected(cfg.getb("snap", false));
+        cOld.setSelected(cfg.getb("old", false));
+    }
+
+    // Повертає поля сторінки «Налаштування» до збережених значень (скидає незбережені зміни).
+    void reloadSettingsForm() {
         String did = cfg.get("discord", "").trim();
         discF.setText(did.isEmpty() ? Theme.DISCORD_ID : did);
-        discC.setSelected(cfg.getb("discordOn", true));
-        onlineC.setSelected(cfg.getb("onlineOn", true));
+        discC.setSelected(cfg.getb("discordOn", false));
         javaF.setText(cfg.get("java", ""));
         syncJavaCombo();
         jvmF.setText(cfg.get("jvm", ""));
@@ -1386,23 +1539,75 @@ final class LauncherWindow extends JFrame {
         int w = cfg.geti("w", 0), h = cfg.geti("h", 0);
         wF.setText(w > 0 ? String.valueOf(w) : "");
         hF.setText(h > 0 ? String.valueOf(h) : "");
+        syncResCombo();
+        updateResHint();
         dirF.setText(cfg.get("gameDir", root.toString()));
         hideC.setSelected(cfg.getb("hide", true));
-        cRel.setSelected(cfg.getb("rel", true));
-        cSnap.setSelected(cfg.getb("snap", false));
-        cOld.setSelected(cfg.getb("old", false));
+    }
+
+    // ---- підказки й вибір роздільності ----
+    void wireResSync() {
+        javax.swing.event.DocumentListener rl = new javax.swing.event.DocumentListener() {
+            void upd() { syncResCombo(); updateResHint(); }
+            @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { upd(); }
+            @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { upd(); }
+            @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { upd(); }
+        };
+        wF.getDocument().addDocumentListener(rl);
+        hF.getDocument().addDocumentListener(rl);
+    }
+
+    // Роздільність гри: обидва числа обов'язкові; інакше — стандартний розмір вікна.
+    int[] resolution() {
+        String ws = wF.getText().trim(), hs = hF.getText().trim();
+        if (!ws.matches("\\d{3,5}") || !hs.matches("\\d{3,5}")) return null;
+        int w = Integer.parseInt(ws), h = Integer.parseInt(hs);
+        return w >= 320 && h >= 240 && w <= 16384 && h <= 16384 ? new int[]{w, h} : null;
+    }
+
+    void syncResCombo() {
+        if (resSync) return;
+        String ws = wF.getText().trim(), hs = hF.getText().trim();
+        int idx = resC.getItemCount() - 1;
+        if (ws.isEmpty() && hs.isEmpty()) idx = 0;
+        else for (int i = 0; i < RES_PRESETS.length; i++)
+            if (ws.equals(String.valueOf(RES_PRESETS[i][0])) && hs.equals(String.valueOf(RES_PRESETS[i][1]))) { idx = i + 1; break; }
+        resSync = true;
+        resC.setSelectedIndex(idx);
+        resSync = false;
+    }
+
+    void updateResHint() {
+        if (wF.getText().trim().isEmpty() && hF.getText().trim().isEmpty()) {
+            resHint.setText(I18n.t("Гра відкриється зі стандартним розміром вікна"));
+        } else if (resolution() != null) {
+            resHint.setText(I18n.t("Застосується після натискання «Зберегти» при наступному запуску гри"));
+        } else {
+            resHint.setText(I18n.t("Вкажи ширину й висоту числами (від 320×240), інакше буде стандартний розмір"));
+        }
+    }
+
+    // Зберігає лише вибір версії гри та фільтри списку версій (вони не на сторінці налаштувань).
+    // Налаштування зі сторінки «Налаштування» (Java, пам'ять, роздільність тощо) пишуться тільки кнопкою «Зберегти».
+    void saveVersion() {
+        cfg.set("rel", String.valueOf(cRel.isSelected()));
+        cfg.set("snap", String.valueOf(cSnap.isSelected()));
+        cfg.set("old", String.valueOf(cOld.isSelected()));
+        Object sel = versions.getSelectedItem();
+        if (sel instanceof VItem) cfg.set("version", ((VItem) sel).key());
+        cfg.save();
     }
 
     void saveSettings() {
-        if (discF.getText().trim().isEmpty()) discF.setText(Theme.DISCORD_ID);
-        cfg.set("discord", discF.getText().trim());
+        String discId = discF.getText().trim().isEmpty() ? Theme.DISCORD_ID : discF.getText().trim();
+        cfg.set("discord", discId);
         cfg.set("discordOn", String.valueOf(discC.isSelected()));
-        cfg.set("onlineOn", String.valueOf(onlineC.isSelected()));
         cfg.set("java", javaPath());
         cfg.set("jvm", jvmF.getText().trim());
         cfg.set("ram", String.valueOf(ram.getValue() * 512));
-        cfg.set("w", wF.getText().trim().matches("\\d+") ? wF.getText().trim() : "0");
-        cfg.set("h", hF.getText().trim().matches("\\d+") ? hF.getText().trim() : "0");
+        int[] rs = resolution();
+        cfg.set("w", rs != null ? String.valueOf(rs[0]) : "0");
+        cfg.set("h", rs != null ? String.valueOf(rs[1]) : "0");
         cfg.set("gameDir", dirF.getText().trim().isEmpty() ? root.toString() : dirF.getText().trim());
         cfg.set("hide", String.valueOf(hideC.isSelected()));
         cfg.set("rel", String.valueOf(cRel.isSelected()));
@@ -1411,7 +1616,7 @@ final class LauncherWindow extends JFrame {
         Object sel = versions.getSelectedItem();
         if (sel instanceof VItem) cfg.set("version", ((VItem) sel).key());
         cfg.save();
-        rpc.configure(discC.isSelected() ? discF.getText().trim() : "");
+        rpc.configure(discC.isSelected() ? discId : "");
     }
 
     String selectedId() {
@@ -1764,13 +1969,14 @@ final class LauncherWindow extends JFrame {
 
     void browse(String url) {
         try {
+            if (url == null || !url.startsWith("https://")) return;
             if (Desktop.isDesktopSupported()) Desktop.getDesktop().browse(URI.create(url));
         } catch (Exception e) { msg(I18n.t("Відкрий вручну: ") + url); }
     }
 
     static Btn small(Btn b) {
         b.setBorder(new EmptyBorder(10, 16, 10, 16));
-        b.setFont(Theme.font(Font.BOLD, 13));
+        b.setFont(Theme.bfont(Font.BOLD, 13));
         return b;
     }
 
@@ -1796,6 +2002,7 @@ final class LauncherWindow extends JFrame {
         mSeq.incrementAndGet();
         mfSeq.incrementAndGet();
         mModel.clear();
+        mLoading = false;
         mFiles.removeAllItems();
         mInstall.setEnabled(false);
         mMore.setEnabled(false);
@@ -1812,6 +2019,8 @@ final class LauncherWindow extends JFrame {
         ModApi.Kind k = curKind();
         setModInfo(k.isMod() && p.loader().equals("Vanilla")
                 ? I18n.t("Чиста збірка не підтримує моди. Створи збірку на основі Fabric / Quilt / Forge / NeoForge (набори ресурсів працюють і в чистій).")
+                : k == ModApi.Kind.SHADER
+                ? I18n.t("Шейдерам потрібен мод Iris (Fabric / Quilt / NeoForge) або OptiFine — встанови його в цю збірку на вкладці «Моди».")
                 : null);
         refreshInstalled();
         if (modsInit && (!k.isMod() || !p.loader().equals("Vanilla"))) search(false, true);
@@ -1875,6 +2084,7 @@ final class LauncherWindow extends JFrame {
             int my = seq.incrementAndGet();
             lv.removeAllItems();
             if (mo == null || to == null) return;
+            prefetchMods((String) mo, Engine.detectLoader((String) to));   // поки користувач у діалозі — моди вже вантажаться
             hint.setText(I18n.t("Завантаження списку версій ") + to + "…");
             new Thread(() -> {
                 List<Engine.LV> list = null;
@@ -1938,6 +2148,7 @@ final class LauncherWindow extends JFrame {
         engine.stop = false;
         cancelUi(true, pCancel, pPause);
         Engine.Progress pg = (tx, fr) -> SwingUtilities.invokeLater(() -> { mStatus.setText(tx); mBar.set(fr); });
+        if (fresh) prefetchMods(mcv, Engine.detectLoader(ldType));   // моди вантажаться паралельно зі встановленням завантажувача
         new Thread(() -> {
             try {
                 String vid;
@@ -1949,6 +2160,7 @@ final class LauncherWindow extends JFrame {
                 String jar = Json.string(v.get("_jar"));
                 String mcId = jar != null ? jar : vid;
                 String loader = Engine.detectLoader(vid);
+                prefetchMods(mcId, loader);
                 Path d = instDir(n);
                 Files.createDirectories(d.resolve("mods"));
                 Properties pr = new Properties();
@@ -2015,11 +2227,12 @@ final class LauncherWindow extends JFrame {
 
         mKind.addItem(ModApi.Kind.MOD);
         mKind.addItem(ModApi.Kind.PACK);
-        mKind.setPreferredSize(new Dimension(170, 44));
+        mKind.addItem(ModApi.Kind.SHADER);
+        mKind.setPreferredSize(new Dimension(190, 44));
         mProf.setPreferredSize(new Dimension(260, 44));
 
         Btn newB = small(new Btn(I18n.t("Нова збірка"), Btn.Kind.SECONDARY));
-        Btn delB = small(new Btn(I18n.t("Видалити"), Btn.Kind.SECONDARY));
+        Btn delB = small(new Btn(I18n.t("Видалити збірку"), Btn.Kind.SECONDARY));
         Btn dirB = small(mDirB);
         small(mSearch);
         small(mToggleView);
@@ -2321,7 +2534,9 @@ final class LauncherWindow extends JFrame {
         mPage.setEnabled(false);
 
         mProf.addActionListener(e -> { if (!mFilling) onProfileChanged(); });
+        mPulse.addActionListener(e -> { if (mLoading) mList.repaint(); else mPulse.stop(); });
         mKind.addActionListener(e -> {
+            kindNow = curKind();
             applyKindTexts();
             if (modsInit && !mFilling) { showInstalledView(false); onProfileChanged(); }
         });
@@ -2545,19 +2760,29 @@ final class LauncherWindow extends JFrame {
         int my = mSeq.incrementAndGet();
         mSearch.setEnabled(false);
         mMore.setEnabled(false);
+        if (!more) {
+            mModel.clear();
+            mLoading = true;
+            if (!mPulse.isRunning()) mPulse.start();
+            dTitle.setText(I18n.t("Завантаження…"));
+            mList.repaint();
+        }
         mStatus.setText(I18n.t("Пошук: ") + k.title.toLowerCase(Locale.ROOT) + I18n.t(" на Modrinth…"));
         new Thread(() -> {
             List<ModApi.Hit> res = null;
             String err = null;
             try { res = api.search(k, q, p.mc(), p.loader(), off); } catch (Exception ex) { err = ex.getMessage(); }
+            if (res != null && my == mSeq.get()) warmHits(res, 700);   // іконки й опис — до показу, щоб список з'являвся цілим
             List<ModApi.Hit> rr = res;
             String er = err;
             SwingUtilities.invokeLater(() -> {
                 if (my != mSeq.get()) return;
+                mLoading = false;
                 mSearch.setEnabled(true);
                 if (!more) mModel.clear();
                 if (rr != null) for (ModApi.Hit h : rr) mModel.addElement(h);
                 if (!more && !mModel.isEmpty() && mList.getSelectedIndex() < 0) mList.setSelectedIndex(0);
+                if (!more && mModel.isEmpty()) showDetails(null);
                 mMore.setEnabled(rr != null && rr.size() >= ModApi.PAGE);
                 mStatus.setText(er != null ? I18n.t("Помилка пошуку: ") + er
                         : mModel.isEmpty() ? I18n.t("Нічого не знайдено для ") + target(k, p)
@@ -2841,10 +3066,10 @@ final class LauncherWindow extends JFrame {
     final Set<String> iconBusy = ConcurrentHashMap.newKeySet();
     final Map<String, String> fileIcon = new ConcurrentHashMap<>();
     String iconDirKey = "";
-    final ExecutorService iconPool = Executors.newFixedThreadPool(3, r -> {
+    final ExecutorService iconPool = Executors.newFixedThreadPool(6, r -> {
         Thread t = new Thread(r, "mod-icons");
         t.setDaemon(true);
-        t.setPriority(Thread.MIN_PRIORITY);
+        t.setPriority(Thread.NORM_PRIORITY - 1);
         return t;
     });
 
@@ -2863,6 +3088,22 @@ final class LauncherWindow extends JFrame {
     final Map<String, Long> iconRetryAt = new ConcurrentHashMap<>();
 
     BufferedImage fetchProjectIcon(String url) {
+        Path cf = null;
+        try {
+            cf = api.cacheDir("icons").resolve(ModApi.sha1s(url) + ".png");
+            if (Files.isRegularFile(cf)) {
+                BufferedImage c = javax.imageio.ImageIO.read(cf.toFile());
+                if (c != null) return c;
+            }
+        } catch (Throwable ignored) { }
+        BufferedImage got = fetchProjectIconNet(url);
+        if (got != null && cf != null) {
+            try { javax.imageio.ImageIO.write(got, "png", cf.toFile()); } catch (Throwable ignored) { }
+        }
+        return got;
+    }
+
+    BufferedImage fetchProjectIconNet(String url) {
         try {
             BufferedImage src = fetchImage(url);
             if (src == null && url.matches(".*_\\d+\\.webp(\\?.*)?$")) {
@@ -2871,9 +3112,6 @@ final class LauncherWindow extends JFrame {
                     src = fetchImage(base + ext);
                     if (src != null) break;
                 }
-            }
-            if (src == null) {
-                src = fetchImage("https://wsrv.nl/?output=png&w=128&h=128&fit=cover&url=" + URLEncoder.encode(url, StandardCharsets.UTF_8));
             }
             return src == null ? null : roundIcon(src, 64);
         } catch (Throwable e) {
@@ -2906,9 +3144,12 @@ final class LauncherWindow extends JFrame {
         try {
             HttpRequest rq = HttpRequest.newBuilder(URI.create(url)).header("User-Agent", "PaxLauncher/1.0")
                     .timeout(Duration.ofSeconds(15)).build();
-            HttpResponse<byte[]> r = engine.http.send(rq, HttpResponse.BodyHandlers.ofByteArray());
-            if (r.statusCode() != 200) return null;
-            return javax.imageio.ImageIO.read(new ByteArrayInputStream(r.body()));
+            HttpResponse<java.io.InputStream> r = engine.http.send(rq, HttpResponse.BodyHandlers.ofInputStream());
+            if (r.statusCode() != 200) { r.body().close(); return null; }
+            byte[] body;
+            try (java.io.InputStream in = r.body()) { body = in.readNBytes(4_000_001); }   // не тягнемо в пам'ять «нескінченні» відповіді
+            if (body.length > 4_000_000) return null;
+            return ModApi.readImage(body);
         } catch (Throwable e) {
             return null;
         }
@@ -2925,15 +3166,16 @@ final class LauncherWindow extends JFrame {
     final Combo<String> gFilter = new Combo<>();
     final JPanel gGrid = new JPanel(new WrapGrid(ShotCard.W, ShotCard.H, 14));
     final JLabel gInfo = label(" ", 13, false, Theme.MUTED);
+    final JLabel gEmpty = label(I18n.t("Знятків ще немає"), 20, true, Theme.MUTED);
     final Btn gMore = new Btn(I18n.t("Показати ще"), Btn.Kind.SECONDARY);
     List<Shot> gShots = new ArrayList<>();
     int gShown = SHOT_PAGE;
     boolean gFilling;
     final AtomicInteger gSeq = new AtomicInteger();
-    final ExecutorService shotPool = Executors.newSingleThreadExecutor(r -> {
+    final ExecutorService shotPool = Executors.newFixedThreadPool(3, r -> {
         Thread t = new Thread(r, "shot-thumbs");
         t.setDaemon(true);
-        t.setPriority(Thread.MIN_PRIORITY);
+        t.setPriority(Thread.NORM_PRIORITY - 1);
         return t;
     });
     final Map<String, BufferedImage> thumbCache = Collections.synchronizedMap(new LinkedHashMap<String, BufferedImage>(64, 0.75f, true) {
@@ -2972,6 +3214,10 @@ final class LauncherWindow extends JFrame {
         moreP.add(gMore);
 
         VPanel body = new VPanel();
+        gEmpty.setHorizontalAlignment(SwingConstants.CENTER);
+        gEmpty.setBorder(new EmptyBorder(80, 0, 0, 0));
+        gEmpty.setVisible(false);
+        body.row(gEmpty, 0);
         body.row(gGrid, 0);
         body.row(moreP, 16);
         body.end();
@@ -3087,6 +3333,7 @@ final class LauncherWindow extends JFrame {
         int n = Math.min(gShown, list.size());
         for (int i = 0; i < n; i++) gGrid.add(new ShotCard(list.get(i), this));
         gMore.setVisible(list.size() > n);
+        gEmpty.setVisible(list.isEmpty());
         gInfoBase = list.isEmpty() ? I18n.t("Знятків ще немає") : I18n.t("Знятків: ") + list.size();
         gInfo.setText(gInfoBase);
         gGrid.revalidate();
@@ -3146,12 +3393,13 @@ final class LauncherWindow extends JFrame {
     final Accounts accounts = new Accounts(root.resolve("accounts.properties"), engine.http);
     final JLabel accName = label("—", 14, true, Theme.TEXT), accType = label(" ", 12, false, Theme.MUTED);
     final Btn contBtn = new Btn(I18n.t("Продовжити"), Btn.Kind.PRIMARY);
-    Btn loginBack;
+    Btn loginBack, loginMs, loginOff;
+    Component loginOffGap;
     final JPanel savedBox = new JPanel();
     final JLabel savedHdr = label(I18n.t("Ліцензійні обліківки"), 13, true, Theme.MUTED);
 
     static Btn big(Btn b) {
-        b.setFont(Theme.font(Font.BOLD, 15));
+        b.setFont(Theme.bfont(Font.BOLD, 15));
         b.setBorder(new EmptyBorder(15, 22, 15, 22));
         b.setAlignmentX(Component.LEFT_ALIGNMENT);
         b.setMaximumSize(new Dimension(Integer.MAX_VALUE, 54));
@@ -3188,8 +3436,11 @@ final class LauncherWindow extends JFrame {
         col.add(savedHdr);
         col.add(Box.createVerticalStrut(8));
         col.add(savedBox);
+        loginMs = ms;
+        loginOff = off;
+        loginOffGap = Box.createVerticalStrut(10);
         col.add(ms);
-        col.add(Box.createVerticalStrut(10));
+        col.add(loginOffGap);
         col.add(off);
         col.add(Box.createVerticalStrut(10));
         col.add(loginBack);
@@ -3204,7 +3455,7 @@ final class LauncherWindow extends JFrame {
         center.add(card);
         p.add(center, BorderLayout.CENTER);
 
-        ms.addActionListener(e -> loginMicrosoft());
+        ms.addActionListener(e -> { if (accounts.msAccounts().isEmpty()) loginMicrosoft(); else licenseDialog(); });
         off.addActionListener(e -> offlineDialog());
         return p;
     }
@@ -3253,40 +3504,90 @@ final class LauncherWindow extends JFrame {
 
     void refreshSavedAccounts() {
         if (loginBack != null) loginBack.setVisible(accounts.current() != null);
-        savedBox.removeAll();
         List<Accounts.Acc> list = accounts.msAccounts();
-        savedHdr.setVisible(!list.isEmpty());
-        Accounts.Acc cur = accounts.current();
-        JPanel rows = new JPanel();
-        rows.setOpaque(false);
-        rows.setLayout(new BoxLayout(rows, BoxLayout.Y_AXIS));
+        // Без ліцензії — вхід через Microsoft; щойно ліцензію додано, ця кнопка стає меню «Ліцензійні обліківки» (як «Грати без ліцензії»)
+        if (loginMs != null) loginMs.setText(list.isEmpty() ? I18n.t("Увійти через Microsoft") : I18n.t("Ліцензійні обліківки"));
+        savedBox.removeAll();
+        savedBox.setVisible(false);
+        savedHdr.setVisible(false);
         for (Accounts.Acc acc : list) {
-            boolean active = cur != null && cur.type().equals("ms") && cur.uuid().equals(acc.uuid());
-            rows.add(savedRow(acc, active));
-            rows.add(Box.createVerticalStrut(6));
             if (accounts.headCached(acc.uuid()) == null) {
-                new Thread(() -> {
-                    if (accounts.headFetch(acc.uuid()) != null) SwingUtilities.invokeLater(savedBox::repaint);
-                }, "head-" + acc.name()).start();
+                new Thread(() -> { accounts.headFetch(acc.uuid()); }, "head-" + acc.name()).start();
             }
         }
-        if (!list.isEmpty()) {
-            JScrollPane sp = new JScrollPane(rows);
-            Smooth.install(sp);
-            sp.setBorder(null);
-            sp.setOpaque(false);
-            sp.getViewport().setOpaque(false);
-            sp.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
-            sp.getVerticalScrollBar().setUI(new SlimScrollBarUI());
-            sp.setAlignmentX(Component.LEFT_ALIGNMENT);
-            int h = Math.min(list.size(), 4) * 58;
-            sp.setPreferredSize(new Dimension(380, h));
-            sp.setMaximumSize(new Dimension(Integer.MAX_VALUE, h));
-            savedBox.add(sp);
-            savedBox.add(Box.createVerticalStrut(10));
-        }
-        savedBox.revalidate();
-        savedBox.repaint();
+    }
+
+    // Меню ліцензійних обліківок: список, «Додати обліківку» (той самий вхід через Microsoft), «Видалити», «Грати з цією обліківкою».
+    void licenseDialog() {
+        DefaultListModel<Accounts.Acc> model = new DefaultListModel<>();
+        for (Accounts.Acc a : accounts.msAccounts()) model.addElement(a);
+        JList<Accounts.Acc> list = new JList<>(model);
+        list.setBackground(Theme.CARD2);
+        list.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        list.setFixedCellHeight(36);
+        Accounts.Acc cur = accounts.current();
+        list.setCellRenderer(new DefaultListCellRenderer() {
+            @Override public Component getListCellRendererComponent(JList<?> l, Object v, int i, boolean sel, boolean foc) {
+                super.getListCellRendererComponent(l, v, i, sel, false);
+                Accounts.Acc a = (Accounts.Acc) v;
+                Accounts.Acc c = accounts.current();
+                boolean active = c != null && c.type().equals("ms") && c.uuid().equals(a.uuid());
+                setText(a.name() + (active ? "   ·  " + I18n.t("Поточна обліківка") : ""));
+                setBackground(sel ? Theme.SEL : Theme.CARD2);
+                setForeground(Theme.TEXT);
+                setFont(Theme.font(Font.PLAIN, 14));
+                setBorder(new EmptyBorder(6, 14, 6, 14));
+                return this;
+            }
+        });
+        boolean picked = false;
+        for (int k = 0; k < model.size(); k++)
+            if (cur != null && cur.type().equals("ms") && model.get(k).uuid().equals(cur.uuid())) { list.setSelectedIndex(k); picked = true; }
+        if (!picked && !model.isEmpty()) list.setSelectedIndex(0);
+
+        JScrollPane sp = new JScrollPane(list); Smooth.install(sp);
+        sp.setBorder(null);
+        sp.getViewport().setBackground(Theme.CARD2);
+        sp.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        sp.getVerticalScrollBar().setUI(new SlimScrollBarUI());
+        sp.setPreferredSize(new Dimension(380, 170));
+
+        Btn addB = small(new Btn(I18n.t("Додати обліківку"), Btn.Kind.PRIMARY));
+        Btn delB = small(new Btn(I18n.t("Видалити"), Btn.Kind.SECONDARY));
+        JLabel err = label(" ", 12, false, Theme.MUTED);
+        boolean[] addReq = {false};
+        addB.addActionListener(e -> { addReq[0] = true; Window w = SwingUtilities.getWindowAncestor(addB); if (w != null) w.dispose(); });
+        delB.addActionListener(e -> {
+            Accounts.Acc a = list.getSelectedValue();
+            if (a == null) { err.setText(I18n.t("Спочатку обери обліківку у списку")); return; }
+            accounts.removeMs(a.uuid());
+            model.removeElement(a);
+            err.setText(I18n.t("Видалено: ") + a.name());
+            if (accounts.current() == null) { Theme.headImg = null; updateAccountUi(); }
+            if (!model.isEmpty()) list.setSelectedIndex(0);
+        });
+
+        JPanel bb = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        bb.setOpaque(false);
+        bb.add(addB);
+        bb.add(delB);
+        JPanel south = new JPanel(new BorderLayout(0, 8));
+        south.setOpaque(false);
+        south.add(bb, BorderLayout.NORTH);
+        south.add(err, BorderLayout.SOUTH);
+
+        JPanel pn = new JPanel(new BorderLayout(0, 12));
+        pn.setOpaque(false);
+        pn.add(sp, BorderLayout.CENTER);
+        pn.add(south, BorderLayout.SOUTH);
+
+        boolean ok = Dlg.show(this, I18n.t("Ліцензійні обліківки"), pn, I18n.t("Грати з цією обліківкою"), I18n.t("Закрити"));
+        refreshSavedAccounts();
+        if (addReq[0]) { loginMicrosoft(); return; }
+        if (!ok) return;
+        Accounts.Acc sel = list.getSelectedValue();
+        if (sel == null) { msg(I18n.t("Обери обліківку у списку або додай нову.")); return; }
+        useSaved(sel);
     }
 
     JComponent savedRow(Accounts.Acc acc, boolean active) {
@@ -3385,7 +3686,7 @@ final class LauncherWindow extends JFrame {
 
     void loginMicrosoft() {
         final String cid = Accounts.LEGACY_CID;
-        saveSettings();
+        saveVersion();
         new Thread(() -> {
             try {
                 Accounts.Dev d = accounts.msStart(cid);
@@ -3581,7 +3882,7 @@ final class LauncherWindow extends JFrame {
         Object o = versions.getSelectedItem();
         if (!(o instanceof VItem)) { msg(I18n.t("Спочатку обери версію гри.")); return; }
         VItem it = (VItem) o;
-        saveSettings();
+        saveVersion();
         setBusy(true);
         bar.set(0);
         engine.stop = false;
@@ -3610,9 +3911,9 @@ final class LauncherWindow extends JFrame {
                 String mcv = Json.string(v.get("_jar")) != null ? Json.string(v.get("_jar")) : it.id();
                 String ld = Engine.detectLoader(it.id());
                 inGame = true;
-                rpc.update(I18n.t("Грає в Minecraft ") + mcv,
-                        ld.equals("Vanilla") ? I18n.t("Чиста гра · через PaxLauncher")
-                                : ld + (it.profile() != null ? I18n.t(" · збірка «") + it.profile() + "»" : I18n.t(" · через PaxLauncher")),
+                // Назва активності в Discord і так «PaxLauncher», тож у описі лише версія та завантажувач (Vanilla / Fabric / …)
+                rpc.update("Minecraft " + mcv,
+                        ld + (it.profile() != null ? I18n.t(" · збірка «") + it.profile() + "»" : ""),
                         System.currentTimeMillis() / 1000);
                 if (hide) SwingUtilities.invokeLater(() -> { setVisible(false); trimMemory(); });
                 try (BufferedReader r = new BufferedReader(new InputStreamReader(pr.getInputStream(), StandardCharsets.UTF_8))) {

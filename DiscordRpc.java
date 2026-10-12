@@ -56,6 +56,11 @@ final class DiscordRpc {
         ex.execute(() -> { close0(); told = false; push(); });
     }
 
+    void shutdown() {
+        clientId = "";
+        try { ex.execute(this::close0); ex.shutdown(); } catch (RuntimeException ignored) { }
+    }
+
     void update(String d, String s, long startSec) {
         details = d;
         state = s;
@@ -128,6 +133,8 @@ final class DiscordRpc {
                 for (String d : dirs) {
                     Path sock = Path.of(d, "discord-ipc-" + i);
                     if (!Files.exists(sock)) continue;
+                    try { if (!Files.getOwner(sock).getName().equals(System.getProperty("user.name"))) continue; }   // чужий сокет у /tmp — не довіряємо
+                    catch (Exception e) { continue; }
                     java.nio.channels.SocketChannel ch = java.nio.channels.SocketChannel.open(java.net.StandardProtocolFamily.UNIX);
                     try { ch.connect(java.net.UnixDomainSocketAddress.of(sock)); } catch (IOException e) { ch.close(); continue; }
                     conn = ch;

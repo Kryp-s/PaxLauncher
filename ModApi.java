@@ -35,7 +35,9 @@ final class ModApi {
         MOD("mod", "mods", I18n.t("Моди"), I18n.t("Пошук модів"), I18n.t("Встановлені моди"), I18n.t("Папка модів"),
                 I18n.t("Сторінка мода"), I18n.t("Видалити мод"), I18n.t("Версія мода (для цієї збірки)")),
         PACK("resourcepack", "resourcepacks", I18n.t("Набори ресурсів"), I18n.t("Пошук наборів ресурсів"), I18n.t("Встановлені набори ресурсів"), I18n.t("Папка наборів ресурсів"),
-                I18n.t("Сторінка набору ресурсів"), I18n.t("Видалити набір ресурсів"), I18n.t("Версія набору ресурсів (для цієї збірки)"));
+                I18n.t("Сторінка набору ресурсів"), I18n.t("Видалити набір ресурсів"), I18n.t("Версія набору ресурсів (для цієї збірки)")),
+        SHADER("shader", "shaderpacks", I18n.t("Шейдери"), I18n.t("Пошук шейдерів"), I18n.t("Встановлені шейдери"), I18n.t("Папка шейдерів"),
+                I18n.t("Сторінка шейдера"), I18n.t("Видалити шейдер"), I18n.t("Версія шейдера (для цієї збірки)"));
 
         final String type, folder, title, searchTitle, installedTitle, folderBtn, pageBtn, removeBtn, versionLabel;
 
@@ -262,7 +264,9 @@ final class ModApi {
                 java.util.zip.ZipEntry e = z.getEntry(name);
                 if (e == null || e.isDirectory() || e.getSize() > 8_000_000) continue;
                 try (InputStream in = z.getInputStream(e)) {
-                    BufferedImage im = javax.imageio.ImageIO.read(in);
+                    byte[] data = in.readNBytes(8_000_001);   // розмір у zip можна підробити — міряємо по факту
+                    if (data.length > 8_000_000) continue;
+                    BufferedImage im = readImage(data);
                     if (im != null) return im;
                 } catch (Throwable ignored) { }
             }
@@ -297,6 +301,53 @@ final class ModApi {
 
     private final Map<String, String> trCache = new ConcurrentHashMap<>();
     private volatile long trFailUntil;
+    private volatile boolean trDirty;
+    private volatile boolean trLoaded;
+
+    private static String esc2(String v) { return v.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", ""); }
+
+    private static String unesc2(String v) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            if (c == '\\' && i + 1 < v.length()) {
+                char n = v.charAt(++i);
+                sb.append(n == 't' ? '\t' : n == 'n' ? '\n' : n);
+            } else sb.append(c);
+        }
+        return sb.toString();
+    }
+
+    // Переклади описів зберігаються на диску, тож після перезапуску список одразу з готовими українськими описами.
+    private synchronized void loadTranslations() {
+        if (trLoaded) return;
+        trLoaded = true;
+        String lang = I18n.descLang();
+        if (lang == null) return;
+        Path f = cacheDir("tr").resolve("desc-" + lang + ".tsv");
+        try {
+            if (Files.isRegularFile(f))
+                for (String ln : Files.readAllLines(f, StandardCharsets.UTF_8)) {
+                    int t = ln.indexOf('\t');
+                    if (t > 0) trCache.put(unesc2(ln.substring(0, t)), unesc2(ln.substring(t + 1)));
+                }
+        } catch (Throwable ignored) { }
+        Thread w = new Thread(() -> {
+            while (true) {
+                try { Thread.sleep(4000); } catch (InterruptedException e) { return; }
+                if (!trDirty) continue;
+                trDirty = false;
+                try {
+                    StringBuilder sb = new StringBuilder();
+                    for (Map.Entry<String, String> e : trCache.entrySet())
+                        sb.append(esc2(e.getKey())).append('\t').append(esc2(e.getValue())).append('\n');
+                    Files.writeString(f, sb.toString(), StandardCharsets.UTF_8);
+                } catch (Throwable ignored) { }
+            }
+        }, "tr-save");
+        w.setDaemon(true);
+        w.start();
+    }
 
     private static boolean mostlyCyrillic(String t) {
         int cyr = 0, lat = 0;
@@ -310,12 +361,17 @@ final class ModApi {
 
     String cached(String text) {
         if (text == null) return "";
+        if (!trLoaded) loadTranslations();
         String c = trCache.get(text);
         return c != null ? c : text;
     }
 
+    /** Переклад описів надсилає тексти до Google — лише з явної згоди користувача (налаштування). */
+    static volatile boolean translateOn;
+
     boolean needsTranslation(String text) {
-        return I18n.descLang() != null && text != null && !text.isBlank() && !trCache.containsKey(text) && !mostlyCyrillic(text);
+        if (!trLoaded) loadTranslations();
+        return translateOn && I18n.descLang() != null && text != null && !text.isBlank() && !trCache.containsKey(text) && !mostlyCyrillic(text);
     }
 
     String translate(String text) {
@@ -323,6 +379,7 @@ final class ModApi {
         if (text == null || text.isBlank()) return text == null ? "" : text;
         String c = trCache.get(text);
         if (c != null) return c;
+        if (!translateOn) return text;
         if (mostlyCyrillic(text)) { trCache.put(text, text); return text; }
         if (System.currentTimeMillis() < trFailUntil) return text;
         try {
@@ -341,8 +398,9 @@ final class ModApi {
             }
             String out = sb.toString().trim();
             if (out.isEmpty()) return text;
-            if (trCache.size() > 500) trCache.clear();
+            if (trCache.size() > 3000) trCache.clear();
             trCache.put(text, out);
+            trDirty = true;
             return out;
         } catch (Exception e) {
             trFailUntil = System.currentTimeMillis() + 20_000;
@@ -374,7 +432,120 @@ final class ModApi {
         }
     }
 
+    // Кеш пошуку на 20 хвилин + спільний запит: якщо результат уже завантажується (наприклад, наперед), чекаємо на нього,
+    // а не робимо другий запит. Відкриття вкладки «Моди» після створення збірки стає майже миттєвим.
+    private final Map<String, java.util.concurrent.CompletableFuture<List<Hit>>> searchCache = new ConcurrentHashMap<>();
+    private final Map<String, Long> searchTime = new ConcurrentHashMap<>();
+
     List<Hit> search(Kind kind, String q, String mc, String loader, int offset) throws Exception {
+        String key = kind.type + "|" + q + "|" + mc + "|" + loader + "|" + offset;
+        Long at = searchTime.get(key);
+        if (at != null && System.currentTimeMillis() - at > 1_200_000) { searchCache.remove(key); searchTime.remove(key); }
+        java.util.concurrent.CompletableFuture<List<Hit>> have = searchCache.get(key);
+        if (have != null) {
+            try { return new ArrayList<>(have.get(40, java.util.concurrent.TimeUnit.SECONDS)); }
+            catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) { searchCache.remove(key, have); }
+        }
+        java.util.concurrent.CompletableFuture<List<Hit>> mine = new java.util.concurrent.CompletableFuture<>();
+        java.util.concurrent.CompletableFuture<List<Hit>> prev = searchCache.putIfAbsent(key, mine);
+        if (prev != null) {
+            try { return new ArrayList<>(prev.get(40, java.util.concurrent.TimeUnit.SECONDS)); }
+            catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) { return searchNet(kind, q, mc, loader, offset); }
+        }
+        boolean first = offset == 0 && q.isEmpty();
+        if (first) {   // кеш на диску: перша сторінка відкривається миттєво навіть після перезапуску запускача
+            long[] age = new long[1];
+            List<Hit> d = diskLoad(kind, key, age);
+            if (d != null) {
+                searchTime.put(key, System.currentTimeMillis());
+                mine.complete(d);
+                if (age[0] > 6 * 3600_000L) {   // застарілий — тихо оновлюємо для наступного разу
+                    Thread t = new Thread(() -> {
+                        try {
+                            List<Hit> fresh = searchNet(kind, q, mc, loader, 0);
+                            diskSave(key, fresh);
+                            searchCache.put(key, java.util.concurrent.CompletableFuture.completedFuture(fresh));
+                            searchTime.put(key, System.currentTimeMillis());
+                        } catch (Throwable ignored) { }
+                    }, "mods-refresh");
+                    t.setDaemon(true);
+                    t.start();
+                }
+                return new ArrayList<>(d);
+            }
+        }
+        try {
+            List<Hit> r = searchNet(kind, q, mc, loader, offset);
+            if (first) diskSave(key, r);
+            searchTime.put(key, System.currentTimeMillis());
+            mine.complete(r);
+            return new ArrayList<>(r);
+        } catch (Exception e) {
+            mine.completeExceptionally(e);
+            searchCache.remove(key, mine);
+            throw e;
+        }
+    }
+
+    static String sha1s(String text) {
+        try {
+            byte[] d = MessageDigest.getInstance("SHA-1").digest(text.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : d) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) { return Integer.toHexString(text.hashCode()); }
+    }
+
+    Path cacheDir(String sub) {
+        Path d = eng.root.resolve("cache").resolve(sub);
+        try { Files.createDirectories(d); } catch (IOException ignored) { }
+        return d;
+    }
+
+    private static String flat(String v) { return v == null ? "" : v.replace('\t', ' ').replace('\n', ' ').replace('\r', ' '); }
+
+    void diskSave(String key, List<Hit> hits) {
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append(System.currentTimeMillis()).append('\n');
+            for (Hit h : hits) {
+                sb.append(flat(h.id())).append('\t').append(flat(h.slug())).append('\t').append(flat(h.title())).append('\t')
+                  .append(flat(h.author())).append('\t').append(flat(h.desc())).append('\t').append(h.downloads()).append('\t')
+                  .append(flat(h.loaders())).append('\t').append(flat(h.iconUrl())).append('\n');
+            }
+            Path f = cacheDir("search").resolve(sha1s(key) + ".tsv");
+            Path tmp = f.resolveSibling(f.getFileName() + ".tmp");
+            Files.writeString(tmp, sb.toString(), StandardCharsets.UTF_8);
+            Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING);
+        } catch (Throwable ignored) { }
+    }
+
+    List<Hit> diskLoad(Kind kind, String key, long[] age) {
+        try {
+            Path f = cacheDir("search").resolve(sha1s(key) + ".tsv");
+            if (!Files.isRegularFile(f)) return null;
+            List<String> ls = Files.readAllLines(f, StandardCharsets.UTF_8);
+            if (ls.size() < 2) return null;
+            long at = Long.parseLong(ls.get(0).trim());
+            if (System.currentTimeMillis() - at > 7L * 24 * 3600_000L) return null;
+            age[0] = System.currentTimeMillis() - at;
+            List<Hit> out = new ArrayList<>();
+            for (int i = 1; i < ls.size(); i++) {
+                String[] c = ls.get(i).split("\t", -1);
+                if (c.length < 8) return null;
+                out.add(new Hit(kind, c[0], c[1], c[2], c[3], c[4], Long.parseLong(c[5]), c[6], c[7]));
+                if (!c[7].isEmpty()) iconByProject.put(c[0], c[7]);
+            }
+            return out.isEmpty() ? null : out;
+        } catch (Throwable e) { return null; }
+    }
+
+    // Прогріває з'єднання з Modrinth (TLS), щоб перший справжній запит не чекав на рукостискання.
+    void warm() {
+        try { get(MR + "/"); } catch (Throwable ignored) { }
+    }
+
+    private List<Hit> searchNet(Kind kind, String q, String mc, String loader, int offset) throws Exception {
         StringBuilder f = new StringBuilder("[[\"project_type:" + kind.type + "\"],[\"versions:" + mc + "\"]");
         if (kind.isMod()) {
             List<String> cats = modrinthLoaders(loader);
@@ -424,10 +595,19 @@ final class ModApi {
                     deps.add(s(dm.get("project_id")));
             }
             out.add(new ModFile(str(v.get("version_number")), str(file.get("filename")), s(file.get("url")),
-                    s(m(file.get("hashes")) == null ? null : m(file.get("hashes")).get("sha1")),
+                    bestHash(m(file.get("hashes"))),
                     channel.isEmpty() ? "release" : channel, date.length() >= 10 ? date.substring(0, 10) : "", deps));
         }
         return out;
+    }
+
+    /** Модрінт віддає sha512 і sha1: беремо сильніший (поле ModFile.sha1 тепер може містити sha512). */
+    private static String bestHash(Map<String, Object> h) {
+        if (h == null) return null;
+        String x = s(h.get("sha512"));
+        if (x != null && x.matches("[0-9a-fA-F]{128}")) return x;
+        x = s(h.get("sha1"));
+        return x != null && x.matches("[0-9a-fA-F]{40}") ? x : null;
     }
 
     record ImportRow(String file, String title, String reason) {
@@ -493,7 +673,39 @@ final class ModApi {
     }
 
     static String safeName(String n) {
-        return n.replaceAll("[\\\\/:*?\"<>|]", "_");
+        String s = (n == null ? "" : n).replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_").trim();
+        s = s.replaceAll("[. ]+$", "");
+        if (s.isEmpty()) s = "_";
+        if (s.matches("(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(\\..*)?")) s = "_" + s;
+        if (s.length() > 150) {
+            int dot = s.lastIndexOf('.');
+            String ext = dot > 0 && s.length() - dot <= 10 ? s.substring(dot) : "";
+            s = s.substring(0, 150 - ext.length()) + ext;
+        }
+        return s;
+    }
+
+    /** Файл рівно в папці dir (без «..», підпапок і абсолютних шляхів). */
+    static Path child(Path dir, String name) throws IOException {
+        Path d = dir.toAbsolutePath().normalize();
+        Path p = d.resolve(name).normalize();
+        if (name.isEmpty() || !d.equals(p.getParent())) throw new IOException("bad file name: " + name);
+        return p;
+    }
+
+    /** Читає картинку, відмовляючись від «бомб»: ліміт на кількість пікселів до декодування. */
+    static BufferedImage readImage(byte[] data) {
+        if (data == null || data.length == 0) return null;
+        try (javax.imageio.stream.ImageInputStream is = javax.imageio.ImageIO.createImageInputStream(new ByteArrayInputStream(data))) {
+            java.util.Iterator<javax.imageio.ImageReader> it = javax.imageio.ImageIO.getImageReaders(is);
+            if (!it.hasNext()) return null;
+            javax.imageio.ImageReader r = it.next();
+            try {
+                r.setInput(is, true, true);
+                if ((long) r.getWidth(0) * r.getHeight(0) > 16_000_000L) return null;
+                return r.read(0);
+            } finally { r.dispose(); }
+        } catch (Throwable e) { return null; }
     }
 
     void install(Kind kind, String id, ModFile f, String mc, String loader, Path dir,
@@ -510,9 +722,12 @@ final class ModApi {
         Files.createDirectories(dir);
         Properties reg = loadReg(dir);
         String old = reg.getProperty(key);
+        if (old != null) { try { child(dir, old); } catch (IOException bad) { old = null; } }   // реєстр лежить у папці гри — йому не довіряємо
         if (isDep && old != null && (Files.exists(dir.resolve(old)) || Files.exists(dir.resolve(old + ".disabled")))) return;
         if (f.url() == null) throw new IOException(I18n.t("Автор заборонив завантаження сторонніми запускачами — візьми файл на сайті."));
+        if (f.sha1() == null) throw new IOException(I18n.t("Немає контрольної суми файлу — відмовляюсь завантажувати неперевірений файл."));
         String fn = safeName(f.filename());
+        child(dir, fn);
         status.accept((isDep ? I18n.t("Залежність: ") : I18n.t("Завантаження: ")) + fn);
         eng.download(f.url(), dir.resolve(fn), f.sha1(), cancel);
         if (old != null && !old.equals(fn)) {

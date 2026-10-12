@@ -12,13 +12,21 @@ final class UiScale {
     static double pick(int w, int h) {
         double s = Math.min(w / 1240.0, h / 780.0);
         if (s < 1.08) return 1.0;
-        s = Math.min(1.6, s);
+        s = 1 + (s - 1) * 0.5;   // інтерфейс росте приблизно вдвічі повільніше за вікно (раніше — майже 1:1)
+        s = Math.min(1.3, s);
         return Math.round(s * 20) / 20.0;
     }
 
     static void apply(Component root, double from, double to) {
         if (Math.abs(from - to) < 0.001) return;
-        walk(root, from, to);
+        walk(root, from, to, true);
+    }
+
+    // Для компонентів, створених уже при масштабі `to`: шрифти в них вже збільшені (Theme.font),
+    // а розміри, відступи й проміжки — ще ні. Масштабуємо лише їх, без шрифтів.
+    static void layoutOnly(Component root, double to) {
+        if (to <= 1.001) return;
+        walk(root, 1.0, to, false);
     }
 
     private static int sc(int v, double from, double to) {
@@ -37,11 +45,21 @@ final class UiScale {
                 base.height >= 100000 ? base.height : (int) Math.round(base.height * to));
     }
 
-    private static void walk(Component c, double from, double to) {
+    private static void walk(Component c, double from0, double to0, boolean fonts) {
+        final double from = c instanceof Btn ? Theme.bs(from0) : from0, to = c instanceof Btn ? Theme.bs(to0) : to0;
+        if (c instanceof JList) {
+            JList<?> jl = (JList<?>) c;
+            Integer base = (Integer) jl.getClientProperty("ui.cell0");
+            if (base == null && jl.getFixedCellHeight() > 0) {
+                base = (int) Math.round(jl.getFixedCellHeight() / from);
+                jl.putClientProperty("ui.cell0", base);
+            }
+            if (base != null) jl.setFixedCellHeight((int) Math.round(base * to));
+        }
         if (c instanceof JComponent) {
             JComponent jc = (JComponent) c;
 
-            if (jc.isFontSet() && jc.getFont() != null && !(jc.getFont() instanceof UIResource)) {
+            if (fonts && jc.isFontSet() && jc.getFont() != null && !(jc.getFont() instanceof UIResource)) {
                 Font base = (Font) jc.getClientProperty(K_FONT);
                 if (base == null) {
                     Font f = jc.getFont();
@@ -106,7 +124,7 @@ final class UiScale {
                 else if (lm instanceof FlowLayout) { ((FlowLayout) lm).setHgap(nh); ((FlowLayout) lm).setVgap(nv); }
                 else { ((BorderLayout) lm).setHgap(nh); ((BorderLayout) lm).setVgap(nv); }
             }
-            for (Component ch : ct.getComponents()) walk(ch, from, to);
+            for (Component ch : ct.getComponents()) walk(ch, from0, to0, fonts);
             if (c instanceof JComponent) ((JComponent) c).revalidate();
         }
     }

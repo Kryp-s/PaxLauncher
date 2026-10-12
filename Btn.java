@@ -47,7 +47,7 @@ final class Btn extends JButton {
         setBorderPainted(false);
         setFocusPainted(false);
         setOpaque(false);
-        setFont(Theme.font(Font.BOLD, 14));
+        setFont(Theme.bfont(Font.BOLD, 14));
         setForeground(Theme.TEXT);
         setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         setBorder(new EmptyBorder(11, 22, 11, 22));
@@ -62,7 +62,7 @@ final class Btn extends JButton {
     void setGlyph(int glyph) { this.glyph = glyph; repaint(); }
 
     @Override public Dimension getPreferredSize() {
-        return glyph != 0 ? new Dimension(46, Theme.TITLE_H) : super.getPreferredSize();
+        return glyph != 0 ? new Dimension(Theme.px(46), Theme.TITLE_H) : super.getPreferredSize();
     }
 
     @Override protected void paintComponent(Graphics g0) {
@@ -130,17 +130,19 @@ final class Btn extends JButton {
                 g.fillRect(0, 0, w, h);
             }
             g.setColor(fg);
-            g.setStroke(new BasicStroke(1.4f, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER));
+            // значки кнопок вікна (згорнути / розгорнути / закрити) ростуть разом із інтерфейсом
+            double k = Math.max(1.0, Theme.S);
             int cx = w / 2, cy = h / 2;
-            g.setStroke(new BasicStroke(1.8f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_MITER));
-            if (glyph == 1) g.drawLine(cx - 7, cy, cx + 7, cy);
-            else if (glyph == 3) g.drawRect(cx - 7, cy - 7, 14, 14);
+            int u = (int) Math.round(7 * k), s4 = (int) Math.round(4 * k), s3 = (int) Math.round(3 * k), s11 = (int) Math.round(11 * k);
+            g.setStroke(new BasicStroke((float) (1.8 * Math.sqrt(k)), BasicStroke.CAP_ROUND, BasicStroke.JOIN_MITER));
+            if (glyph == 1) g.drawLine(cx - u, cy, cx + u, cy);
+            else if (glyph == 3) g.drawRect(cx - u, cy - u, 2 * u, 2 * u);
             else if (glyph == 4) {
-                g.drawRect(cx - 7, cy - 3, 11, 11);
-                g.drawPolyline(new int[]{cx - 3, cx - 3, cx + 7, cx + 7, cx + 4}, new int[]{cy - 3, cy - 7, cy - 7, cy + 3, cy + 3}, 5);
+                g.drawRect(cx - u, cy - s3, s11, s11);
+                g.drawPolyline(new int[]{cx - s3, cx - s3, cx + u, cx + u, cx + s4}, new int[]{cy - s3, cy - u, cy - u, cy + s3, cy + s3}, 5);
             } else {
-                g.drawLine(cx - 7, cy - 7, cx + 7, cy + 7);
-                g.drawLine(cx - 7, cy + 7, cx + 7, cy - 7);
+                g.drawLine(cx - u, cy - u, cx + u, cy + u);
+                g.drawLine(cx - u, cy + u, cx + u, cy - u);
             }
         }
         g.dispose();

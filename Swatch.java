@@ -31,6 +31,9 @@ import javax.swing.border.*;
 import javax.swing.plaf.basic.*;
 
 final class Swatch extends JComponent {
+    // колір, обраний у налаштуваннях, але ще не збережений (null — показуємо поточний колір теми)
+    static Color mark;
+
     private final Color col;
     private final Fx fx = new Fx(this);
 
@@ -50,7 +53,8 @@ final class Swatch extends JComponent {
         Graphics2D g = (Graphics2D) g0.create();
         Theme.aa(g);
         int w = getWidth(), h = getHeight();
-        boolean sel = (Theme.accent.getRGB() & 0xFFFFFF) == (col.getRGB() & 0xFFFFFF);
+        Color curAcc = mark != null ? mark : Theme.accent;
+        boolean sel = (curAcc.getRGB() & 0xFFFFFF) == (col.getRGB() & 0xFFFFFF);
         int in = Math.round(5 - 2 * fx.h());
         if (sel) {
             g.setColor(Theme.TEXT);

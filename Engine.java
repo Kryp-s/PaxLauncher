@@ -35,7 +35,9 @@ final class Engine {
 
     record VInfo(String id, String type, String url) { }
 
-    record Task(String url, Path dest, String sha1) { }
+    record Task(String url, Path dest, String sha1, boolean lazy) {
+        Task(String url, Path dest, String sha1) { this(url, dest, sha1, false); }
+    }
 
     static final String MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
     static final String RES = "https://resources.download.minecraft.net/";
@@ -48,6 +50,7 @@ final class Engine {
             .followRedirects(HttpClient.Redirect.NORMAL)
             .connectTimeout(Duration.ofSeconds(15)).build();
     final Map<String, String> urls = new ConcurrentHashMap<>();
+    final Map<String, String> shas = new ConcurrentHashMap<>();
     volatile List<VInfo> manifest = new ArrayList<>();
     volatile String latestRelease = "";
     volatile boolean stop, paused;
@@ -97,16 +100,90 @@ final class Engine {
         return a.contains("aarch64") || a.contains("arm64");
     }
 
-    String fetch(String url) throws IOException, InterruptedException {
-        HttpRequest r = HttpRequest.newBuilder(URI.create(url))
-                .header("User-Agent", "PaxLauncher/1.0").timeout(Duration.ofSeconds(30)).build();
-        HttpResponse<String> resp = http.send(r, HttpResponse.BodyHandlers.ofString());
-        if (resp.statusCode() != 200) throw new IOException("HTTP " + resp.statusCode() + " — " + url);
-        return resp.body();
+    static final int MAX_FETCH = 64 * 1024 * 1024;
+
+    /** Лише https (http із відомих старих описів мовчки піднімаємо до https). */
+    static String httpsOnly(String url) throws IOException {
+        if (url == null || url.isEmpty()) throw new IOException("empty url");
+        if (url.regionMatches(true, 0, "http://", 0, 7)) url = "https://" + url.substring(7);
+        URI u;
+        try { u = URI.create(url); } catch (IllegalArgumentException e) { throw new IOException("bad url: " + url); }
+        if (!"https".equalsIgnoreCase(u.getScheme()) || u.getHost() == null) throw new IOException("only https allowed: " + url);
+        return url;
     }
 
-    static String sha1(Path f) throws Exception {
-        MessageDigest md = MessageDigest.getInstance("SHA-1");
+    /** Ідентифікатор версії стає частиною шляху на диску — лише безпечні символи. */
+    static final Pattern ID_RE = Pattern.compile("[\\p{L}\\p{N}][\\p{L}\\p{N}._+\\- ()]{0,127}");
+    static String safeId(String id) throws IOException {
+        if (id == null || !ID_RE.matcher(id).matches() || id.contains("..") || id.endsWith(" ") || id.endsWith("."))
+            throw new IOException("Некоректний ідентифікатор версії: " + id);
+        return id;
+    }
+
+    /** base + rel, гарантовано всередині base (без «..», абсолютних шляхів і дисків). */
+    static Path under(Path base, String rel) throws IOException {
+        if (rel == null || rel.isEmpty()) throw new IOException("empty path");
+        Path b = base.toAbsolutePath().normalize();
+        Path p;
+        try { p = b.resolve(rel).normalize(); } catch (java.nio.file.InvalidPathException e) { throw new IOException("bad path: " + rel); }
+        if (!p.startsWith(b) || p.equals(b)) throw new IOException("шлях виходить за межі " + base + ": " + rel);
+        return p;
+    }
+
+    static final Pattern MAIN_RE = Pattern.compile("[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)*");
+
+    private static final Set<String> TAKES_VALUE = Set.of("-p", "--module-path", "-cp", "-classpath", "--class-path",
+            "--add-modules", "--add-opens", "--add-exports", "--add-reads", "--limit-modules");
+    private static final Set<String> BAD_PROPS = Set.of("java.system.class.loader", "java.security.manager", "java.security.policy",
+            "java.security.auth.login.config", "java.ext.dirs", "java.endorsed.dirs", "java.class.path", "sun.boot.class.path",
+            "javax.net.ssl.truststore", "javax.net.ssl.keystore", "javax.net.ssl.truststorepassword", "javax.net.ssl.keystorepassword",
+            "jdk.attach.allowattachself", "sun.java.command");
+    private static final Pattern JVM_MEM = Pattern.compile("-X(mx|ms|mn|ss)\\d{1,8}[kKmMgG]?");
+    private static final Pattern JVM_MISC = Pattern.compile("-XstartOnFirstThread|-Xdock:(name|icon)=.{1,200}");
+    private static final Pattern JVM_MODULE = Pattern.compile("--(add-opens|add-exports|add-reads|add-modules|limit-modules|module-path|class-path)(=.+)?|-p|-cp|-classpath");
+    private static final Pattern JVM_XX = Pattern.compile("-XX:[+-]?(UseG1GC|UseZGC|UseShenandoahGC|UseParallelGC|UseSerialGC|UseConcMarkSweepGC|UseStringDeduplication"
+            + "|G1\\w+|MaxGCPauseMillis|ParallelGCThreads|ConcGCThreads|MaxMetaspaceSize|MetaspaceSize|DisableExplicitGC|AlwaysPreTouch"
+            + "|ParallelRefProcEnabled|HeapDumpOnOutOfMemoryError|PerfDisableSharedMem|OmitStackTraceInFastThrow|UseCompressedOops"
+            + "|Tiered\\w*|MaxTenuringThreshold|SurvivorRatio|NewRatio|NewSize|MaxNewSize|InitiatingHeapOccupancyPercent|MinHeapFreeRatio"
+            + "|MaxHeapFreeRatio|ReservedCodeCacheSize|UseNUMA|UseLargePages|IgnoreUnrecognizedVMOptions|UnlockExperimentalVMOptions"
+            + "|UseCodeCacheFlushing|ShowCodeDetailsInExceptionMessages|DontCompileHugeMethods)(=[A-Za-z0-9_.\\-]{1,16})?"
+            + "|-XX:HeapDumpPath=[A-Za-z0-9_.\\-]{1,128}");
+
+    /** Білий список JVM-аргументів з опису версії (опис може бути підміненим — не довіряємо). */
+    static boolean jvmArgAllowed(String a) {
+        if (a == null || a.isEmpty()) return false;
+        if (a.startsWith("-D")) {
+            int eq = a.indexOf('=');
+            String k = a.substring(2, eq < 0 ? a.length() : eq).toLowerCase(Locale.ROOT);
+            return !k.isEmpty() && !BAD_PROPS.contains(k) && !k.startsWith("com.sun.management.") && !k.startsWith("jdk.internal.");
+        }
+        return JVM_MEM.matcher(a).matches() || JVM_MISC.matcher(a).matches()
+                || JVM_MODULE.matcher(a).matches() || JVM_XX.matcher(a).matches();
+    }
+
+    String fetch(String url) throws IOException, InterruptedException {
+        url = httpsOnly(url);
+        HttpRequest r = HttpRequest.newBuilder(URI.create(url))
+                .header("User-Agent", "PaxLauncher/1.0").timeout(Duration.ofSeconds(30)).build();
+        HttpResponse<java.io.InputStream> resp = http.send(r, HttpResponse.BodyHandlers.ofInputStream());
+        try (java.io.InputStream in = resp.body()) {
+            if (resp.statusCode() != 200) throw new IOException("HTTP " + resp.statusCode() + " — " + url);
+            byte[] b = in.readNBytes(MAX_FETCH + 1);
+            if (b.length > MAX_FETCH) throw new IOException("відповідь завелика — " + url);
+            return new String(b, StandardCharsets.UTF_8);
+        }
+    }
+
+    static String sha1(Path f) throws Exception { return digest(f, "SHA-1"); }
+
+    /** Алгоритм обираємо за довжиною очікуваного хешу: 128 = SHA-512, 64 = SHA-256, інакше SHA-1. */
+    static String hashFor(Path f, String expected) throws Exception {
+        int n = expected == null ? 0 : expected.length();
+        return digest(f, n == 128 ? "SHA-512" : n == 64 ? "SHA-256" : "SHA-1");
+    }
+
+    static String digest(Path f, String algo) throws Exception {
+        MessageDigest md = MessageDigest.getInstance(algo);
         try (InputStream in = Files.newInputStream(f)) {
             byte[] buf = new byte[65536];
             int n;
@@ -181,7 +258,18 @@ final class Engine {
         boolean zip = osName().equals("windows");
         String os = osName().equals("osx") ? "mac" : osName();
         String arch = isArm() ? "aarch64" : is64() ? "x64" : "x32";
-        String url = "https://api.adoptium.net/v3/binary/latest/" + n + "/ga/" + os + "/" + arch + "/jre/hotspot/normal/eclipse";
+        String api = "https://api.adoptium.net/v3/assets/latest/" + n + "/hotspot?architecture=" + arch
+                + "&image_type=jre&os=" + os + "&vendor=eclipse";
+        String url = null, sum = null;
+        for (Object o : l(Json.parse(fetch(api)))) {
+            Map<String, Object> pk = m(g(o, "binary", "package"));
+            if (pk == null) continue;
+            String link = s(pk.get("link")), cs = s(pk.get("checksum"));
+            if (link == null || cs == null) continue;
+            if (zip ? link.endsWith(".zip") : link.endsWith(".tar.gz")) { url = link; sum = cs; break; }
+        }
+        if (url == null || !url.startsWith("https://") || sum == null || !sum.matches("[0-9a-fA-F]{64}"))
+            throw new IOException(I18n.t("Не вдалося отримати контрольну суму Java — відмовляюсь ставити неперевірений файл."));
         Path part = base.resolve("java-" + n + (zip ? ".zip" : ".tar.gz") + ".part");
         String title = I18n.t("Завантаження Java ") + n + "…";
         pg.update(title, 0.02);
@@ -206,6 +294,10 @@ final class Engine {
         } catch (Exception e) {
             Files.deleteIfExists(part);
             throw e;
+        }
+        if (!digest(part, "SHA-256").equalsIgnoreCase(sum)) {
+            Files.deleteIfExists(part);
+            throw new IOException(I18n.t("Контрольна сума не збігається: ") + url);
         }
         pg.update(I18n.t("Розпакування…"), 0.92);
         Path tmp = base.resolve("java-" + n + ".tmp");
@@ -251,9 +343,14 @@ final class Engine {
     }
 
     void download(String url, Path dest, String sha1, java.util.function.BooleanSupplier cancel) throws Exception {
-        if (Files.exists(dest) && Files.size(dest) > 0 && (sha1 == null || sha1(dest).equalsIgnoreCase(sha1))) return;
+        download(url, dest, sha1, cancel, false);
+    }
+
+    void download(String url, Path dest, String sha1, java.util.function.BooleanSupplier cancel, boolean trustExisting) throws Exception {
+        if (Files.exists(dest) && Files.size(dest) > 0 && (sha1 == null || trustExisting || hashFor(dest, sha1).equalsIgnoreCase(sha1))) return;
+        url = httpsOnly(url);
         Files.createDirectories(dest.getParent());
-        Path tmp = dest.resolveSibling(dest.getFileName() + ".part");
+        Path tmp = dest.resolveSibling(dest.getFileName() + "." + Long.toHexString(System.nanoTime()) + ".part");
         Exception last = null;
         for (int t = 0; t < 5; t++) {
             if (cancel.getAsBoolean()) throw new Cancelled();
@@ -275,7 +372,7 @@ final class Engine {
                         }
                     }
                 }
-                if (sha1 != null && !sha1(tmp).equalsIgnoreCase(sha1)) throw new IOException(I18n.t("Контрольна сума не збігається: ") + url);
+                if (sha1 != null && !hashFor(tmp, sha1).equalsIgnoreCase(sha1)) throw new IOException(I18n.t("Контрольна сума не збігається: ") + url);
                 Files.move(tmp, dest, StandardCopyOption.REPLACE_EXISTING);
                 return;
             } catch (Cancelled c) {
@@ -297,6 +394,8 @@ final class Engine {
             String id = s(v.get("id"));
             out.add(new VInfo(id, s(v.get("type")), s(v.get("url"))));
             urls.put(id, s(v.get("url")));
+            String vsha = s(v.get("sha1"));
+            if (vsha != null && !vsha.isEmpty()) shas.put(id, vsha);
         }
         manifest = out;
         try { latestRelease = s(m(mf.get("latest")).get("release")); } catch (Exception ignored) { latestRelease = ""; }
@@ -318,13 +417,14 @@ final class Engine {
     }
 
     Map<String, Object> loadVersion(String id) throws Exception {
+        safeId(id);
         Path jf = root.resolve("versions").resolve(id).resolve(id + ".json");
         if (!Files.exists(jf)) {
             String url = urls.get(id);
             if (url == null) throw new IOException(I18n.t("Версію ") + id + I18n.t(" не знайдено (немає інтернету?)"));
             log.accept(I18n.t("Завантаження опису версії ") + id);
             Files.createDirectories(jf.getParent());
-            Files.writeString(jf, fetch(url));
+            download(url, jf, shas.get(id));
         }
         Map<String, Object> v = m(Json.parse(Files.readString(jf)));
         String parent = s(v.get("inheritsFrom"));
@@ -455,7 +555,7 @@ final class Engine {
             if (lv == null) lv = s(m(m(loaders.get(0)).get("loader")).get("version"));
         }
         String profile = fetch("https://meta.fabricmc.net/v2/versions/loader/" + mc + "/" + lv + "/profile/json");
-        String id = s(m(Json.parse(profile)).get("id"));
+        String id = safeId(s(m(Json.parse(profile)).get("id")));
         Path f = root.resolve("versions").resolve(id).resolve(id + ".json");
         Files.createDirectories(f.getParent());
         Files.writeString(f, profile);
@@ -475,7 +575,7 @@ final class Engine {
             if (lv == null) lv = s(m(m(loaders.get(0)).get("loader")).get("version"));
         }
         String profile = fetch("https://meta.quiltmc.org/v3/versions/loader/" + mc + "/" + lv + "/profile/json");
-        String id = s(m(Json.parse(profile)).get("id"));
+        String id = safeId(s(m(Json.parse(profile)).get("id")));
         Path f = root.resolve("versions").resolve(id).resolve(id + ".json");
         Files.createDirectories(f.getParent());
         Files.writeString(f, profile);
@@ -524,7 +624,7 @@ final class Engine {
 
         pg.update(I18n.t("Завантаження встановлювача ") + loader + "…", 0.25);
         Path inst = root.resolve("installers").resolve(name);
-        download(url, inst, null);
+        download(url, inst, remoteHash(url));
 
         pg.update(I18n.t("Встановлення ") + loader + I18n.t(" (це може зайняти кілька хвилин)…"), 0.45);
         Set<String> before = new HashSet<>(installedIds());
@@ -550,11 +650,59 @@ final class Engine {
         throw new IOException(I18n.t("Встановлювач відпрацював, але нову версію не знайдено в ") + root.resolve("versions"));
     }
 
-    Path authlib() throws Exception {
+    /** Контрольна сума з maven-репозиторію (.sha256, інакше .sha1). Без неї файл не запускаємо. */
+    String remoteHash(String url) throws IOException {
+        for (String ext : new String[]{".sha256", ".sha1"}) {
+            try {
+                String b = fetch(url + ext).trim();
+                int sp = b.indexOf(' ');
+                if (sp > 0) b = b.substring(0, sp);
+                if (b.matches("[0-9a-fA-F]{64}") || b.matches("[0-9a-fA-F]{40}")) return b.toLowerCase();
+            } catch (Exception ignored) { }
+        }
+        throw new IOException(I18n.t("Не вдалося отримати контрольну суму встановлювача — відмовляюсь запускати неперевірений файл."));
+    }
+
+    /** Для бібліотек без хешу в описі (Fabric/Quilt): пробуємо взяти .sha1 з того ж maven. */
+    private String guessSha1(String url, Path dest) {
+        try { if (Files.isRegularFile(dest) && Files.size(dest) > 0) return null; } catch (IOException ignored) { }
+        try {
+            String b = fetch(url + ".sha1").trim();
+            int sp = b.indexOf(' ');
+            if (sp > 0) b = b.substring(0, sp);
+            if (b.matches("[0-9a-fA-F]{40}")) return b.toLowerCase();
+        } catch (Exception ignored) { }
+        return null;
+    }
+
+    /** pin — необов'язкова очікувана SHA-256 (authlibSha256 у launcher.properties): якщо задана, інше не завантажуємо. */
+    Path authlib(String pin) throws Exception {
+        String want = pin == null ? "" : pin.trim().toLowerCase(Locale.ROOT);
+        if (!want.isEmpty() && !want.matches("[0-9a-f]{64}"))
+            throw new IOException(I18n.t("authlibSha256 у launcher.properties має бути SHA-256 (64 hex-символи)."));
         Path f = root.resolve("authlib-injector.jar");
-        if (Files.exists(f) && Files.size(f) > 0) return f;
+        Path sc = root.resolve("authlib-injector.jar.sha256");
+        if (Files.isRegularFile(f) && Files.size(f) > 0 && Files.isRegularFile(sc)) {
+            String have = Files.readString(sc).trim();
+            if (have.matches("[0-9a-fA-F]{64}") && digest(f, "SHA-256").equalsIgnoreCase(have)
+                    && (want.isEmpty() || want.equalsIgnoreCase(have))) return f;
+        }
         Map<String, Object> j = m(Json.parse(fetch("https://authlib-injector.yushi.moe/artifact/latest.json")));
-        download(s(j.get("download_url")), f, null);
+        String dl = s(j.get("download_url"));
+        Map<String, Object> cks = m(j.get("checksums"));
+        String sum = cks == null ? null : s(cks.get("sha256"));
+        if (dl == null || !dl.startsWith("https://") || sum == null || !sum.matches("[0-9a-fA-F]{64}"))
+            throw new IOException(I18n.t("Немає контрольної суми authlib-injector — відмовляюсь завантажувати."));
+        if (!want.isEmpty() && !want.equalsIgnoreCase(sum))
+            throw new IOException(I18n.t("Контрольна сума authlib-injector не збігається із закріпленою (authlibSha256)."));
+        String host = URI.create(dl).getHost();
+        host = host == null ? "" : host.toLowerCase(Locale.ROOT);
+        boolean known = host.equals("yushi.moe") || host.endsWith(".yushi.moe") || host.equals("github.com") || host.endsWith(".githubusercontent.com");
+        if (!known && want.isEmpty())
+            throw new IOException(I18n.t("Невідомий хост завантаження authlib-injector (") + host + I18n.t(") — вкажи очікувану SHA-256 в authlibSha256 (launcher.properties)."));
+        Files.deleteIfExists(f);
+        download(dl, f, sum);
+        Files.writeString(sc, sum.toLowerCase(Locale.ROOT));
         return f;
     }
 
@@ -589,8 +737,10 @@ final class Engine {
         return ok;
     }
 
-    static String mavenPath(String name) {
+    static String mavenPath(String name) throws IOException {
+        if (name == null || name.contains("..") || name.contains("/") || name.contains("\\")) throw new IOException("bad library name: " + name);
         String[] p = name.split(":");
+        if (p.length < 3) throw new IOException("bad library name: " + name);
         String cl = p.length > 3 ? "-" + p[3] : "";
         return p[0].replace('.', '/') + "/" + p[1] + "/" + p[2] + "/" + p[1] + "-" + p[2] + cl + ".jar";
     }
@@ -603,7 +753,14 @@ final class Engine {
         List<Future<Object>> fs = new ArrayList<>();
         for (Task t : tasks) {
             fs.add(pool.submit(() -> {
-                download(t.url(), t.dest(), t.sha1());
+                String sh = t.sha1();
+                if ("?".equals(sh)) {
+                    boolean have = Files.isRegularFile(t.dest()) && Files.size(t.dest()) > 0;
+                    sh = have ? null : guessSha1(t.url(), t.dest());
+                    if (!have && sh == null)
+                        throw new IOException(I18n.t("Немає контрольної суми для ") + t.url() + I18n.t(" — відмовляюсь завантажувати неперевірений файл."));
+                }
+                download(t.url(), t.dest(), sh, () -> stop, t.lazy());
                 int d = done.incrementAndGet();
                 if (d % 5 == 0 || d == total) pg.update(I18n.t("Завантаження файлів: ") + d + " / " + total, (double) d / total);
                 return null;
@@ -642,7 +799,10 @@ final class Engine {
     }
 
     List<String> build(Map<String, Object> v, Settings cfg, Accounts.Acc acc, Progress pg, Path gameDir) throws Exception {
-        String id = s(v.get("id")), jar = s(v.get("_jar"));
+        String id = safeId(s(v.get("id"))), jar = safeId(s(v.get("_jar")));
+        String mainClass = s(v.get("mainClass"));
+        if (mainClass == null || !MAIN_RE.matcher(mainClass).matches())
+            throw new IOException(I18n.t("Некоректний mainClass в описі версії: ") + mainClass);
         Path vroot = root.resolve("versions"), libRoot = root.resolve("libraries"), assetsRoot = root.resolve("assets");
         Files.createDirectories(gameDir);
 
@@ -674,7 +834,7 @@ final class Engine {
             if (!allowed(lib.get("rules"), feats)) continue;
             Map<String, Object> art = m(g(lib, "downloads", "artifact"));
             if (art != null) {
-                Path f = libRoot.resolve(s(art.get("path")));
+                Path f = under(libRoot, s(art.get("path")));
                 String url = s(art.get("url"));
                 if (url != null && !url.isEmpty()) tasks.add(new Task(url, f, s(art.get("sha1"))));
                 cp.add(f);
@@ -683,8 +843,8 @@ final class Engine {
                 String base = s(lib.get("url"));
                 if (base == null) base = LIBS;
                 if (!base.endsWith("/")) base += "/";
-                Path f = libRoot.resolve(path);
-                tasks.add(new Task(base + path, f, null));
+                Path f = under(libRoot, path);
+                tasks.add(new Task(base + path, f, "?"));
                 cp.add(f);
             }
             Map<String, Object> nat = m(lib.get("natives"));
@@ -694,7 +854,7 @@ final class Engine {
                     cls = cls.replace("${arch}", is64() ? "64" : "32");
                     Map<String, Object> na = m(g(lib, "downloads", "classifiers", cls));
                     if (na != null) {
-                        Path f = libRoot.resolve(s(na.get("path")));
+                        Path f = under(libRoot, s(na.get("path")));
                         tasks.add(new Task(s(na.get("url")), f, s(na.get("sha1"))));
                         nativeJars.add(f);
                     }
@@ -705,6 +865,8 @@ final class Engine {
 
         Map<String, Object> ai = m(v.get("assetIndex"));
         String aid = s(ai.get("id"));
+        if (aid == null || !aid.matches("[A-Za-z0-9._\\-]{1,64}") || aid.contains(".."))
+            throw new IOException(I18n.t("Некоректний id індексу ресурсів: ") + aid);
         Path idxFile = assetsRoot.resolve("indexes").resolve(aid + ".json");
         download(s(ai.get("url")), idxFile, s(ai.get("sha1")));
         Map<String, Object> idx = m(Json.parse(Files.readString(idxFile)));
@@ -712,9 +874,10 @@ final class Engine {
         Set<String> seen = new HashSet<>();
         for (var e : objs.entrySet()) {
             String h = s(m(e.getValue()).get("hash"));
+            if (h == null || !h.matches("[0-9a-fA-F]{40}")) throw new IOException(I18n.t("Некоректний хеш ресурсу: ") + h);
             if (seen.add(h)) {
                 String pre = h.substring(0, 2);
-                tasks.add(new Task(RES + pre + "/" + h, assetsRoot.resolve("objects").resolve(pre).resolve(h), null));
+                tasks.add(new Task(RES + pre + "/" + h, assetsRoot.resolve("objects").resolve(pre).resolve(h), h, true));
             }
         }
 
@@ -729,7 +892,7 @@ final class Engine {
             for (var e : objs.entrySet()) {
                 String h = s(m(e.getValue()).get("hash"));
                 Path src = assetsRoot.resolve("objects").resolve(h.substring(0, 2)).resolve(h);
-                Path dst = (virt ? vd : gameDir.resolve("resources")).resolve(e.getKey());
+                Path dst = under(virt ? vd : gameDir.resolve("resources"), e.getKey());
                 if (!Files.exists(dst)) {
                     Files.createDirectories(dst.getParent());
                     Files.copy(src, dst);
@@ -788,7 +951,7 @@ final class Engine {
         cmd.add("-Xmx" + ram + "M");
         cmd.add("-Xms" + Math.min(ram, 1024) + "M");
         if (acc.type().equals("ely")) {
-            try { cmd.add("-javaagent:" + authlib() + "=ely.by"); }
+            try { cmd.add("-javaagent:" + authlib(cfg.get("authlibSha256", "")) + "=ely.by"); }
             catch (Exception e) { log.accept(I18n.t("authlib-injector недоступний: ") + e.getMessage()); }
         }
         String extra = cfg.get("jvm", "").trim();
@@ -796,17 +959,30 @@ final class Engine {
 
         Map<String, Object> args = m(v.get("arguments"));
         if (args != null) {
-            cmd.addAll(expand(l(args.get("jvm")), ph, feats));
-            cmd.add(s(v.get("mainClass")));
+            List<String> jv = expand(l(args.get("jvm")), ph, feats);
+            boolean valueNext = false;
+            for (int ji = 0; ji < jv.size(); ji++) {
+                String a = jv.get(ji);
+                if (valueNext) { valueNext = false; cmd.add(a); continue; }
+                if (jvmArgAllowed(a)) {
+                    cmd.add(a);
+                    valueNext = TAKES_VALUE.contains(a);
+                    continue;
+                }
+                log.accept(I18n.t("Пропущено JVM-аргумент з опису версії (не у білому списку): ") + a);
+                if (a.startsWith("--") && !a.contains("=") && ji + 1 < jv.size() && !jv.get(ji + 1).startsWith("-")) ji++;
+            }
+            cmd.add(mainClass);
             cmd.addAll(expand(l(args.get("game")), ph, feats));
         } else {
             cmd.add("-Djava.library.path=" + nd);
             cmd.add("-cp");
             cmd.add(cpStr);
-            cmd.add(s(v.get("mainClass")));
+            cmd.add(mainClass);
             for (String a : sub(s(v.get("minecraftArguments")), ph).split(" ")) if (!a.isEmpty()) cmd.add(a);
             if (rw > 0 && rh > 0) { cmd.add("--width"); cmd.add(String.valueOf(rw)); cmd.add("--height"); cmd.add(String.valueOf(rh)); }
         }
+        if (rw > 0 && rh > 0 && !cmd.contains("--width")) { cmd.add("--width"); cmd.add(String.valueOf(rw)); cmd.add("--height"); cmd.add(String.valueOf(rh)); }
         return cmd;
     }
 }

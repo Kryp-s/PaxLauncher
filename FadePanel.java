@@ -31,38 +31,64 @@ import javax.swing.border.*;
 import javax.swing.plaf.basic.*;
 
 final class FadePanel extends JPanel {
-    private BufferedImage snap;
-    private float alpha;
-    private final javax.swing.Timer t = new javax.swing.Timer(15, e -> {
-        alpha -= 0.11f;
-        if (alpha <= 0) { alpha = 0; snap = null; ((javax.swing.Timer) e.getSource()).stop(); }
+    private static final int DUR_MS = 300;   // тривалість переходу між розділами
+    private static final int SLIDE = 18;     // наскільки нова сторінка «в'їжджає» знизу, px
+    private BufferedImage oldImg, newImg;
+    private boolean anim;
+    private long t0;
+    // Анімація залежить від часу, а не від кількості кадрів: однаково плавна і на слабкому, і на швидкому ПК.
+    private final javax.swing.Timer t = new javax.swing.Timer(8, e -> {
+        if ((System.nanoTime() - t0) >= DUR_MS * 1e6f) { anim = false; ((javax.swing.Timer) e.getSource()).stop(); }
         repaint();
     });
 
     FadePanel(LayoutManager lm) { super(lm); }
 
+    private BufferedImage fresh(BufferedImage old, int w, int h) {
+        if (old != null && old.getWidth() == w && old.getHeight() == h) return old;
+        GraphicsConfiguration gc = getGraphicsConfiguration();
+        return gc != null ? gc.createCompatibleImage(w, h, Transparency.TRANSLUCENT) : new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+    }
+
+    private void shoot(BufferedImage img) {
+        Graphics2D g = img.createGraphics();
+        g.setComposite(AlphaComposite.Clear);
+        g.fillRect(0, 0, img.getWidth(), img.getHeight());
+        g.setComposite(AlphaComposite.SrcOver);
+        super.paint(g);
+        g.dispose();
+    }
+
     void change(Runnable r) {
         int w = getWidth(), h = getHeight();
         if (w <= 0 || h <= 0 || !isShowing()) { r.run(); return; }
         t.stop();
-        snap = null;
-        BufferedImage im = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
-        Graphics2D g = im.createGraphics();
-        super.paint(g);
-        g.dispose();
+        anim = false;
+        oldImg = fresh(oldImg, w, h);
+        newImg = fresh(newImg, w, h);
+        shoot(oldImg);   // знімок старої сторінки
         r.run();
-        snap = im;
-        alpha = 1f;
+        validate();
+        shoot(newImg);   // знімок нової — далі анімуємо лише готові картинки, це дешево й без ривків
+        anim = true;
+        t0 = System.nanoTime();
         t.start();
     }
 
     @Override public void paint(Graphics g) {
-        super.paint(g);
-        if (snap != null && alpha > 0) {
-            Graphics2D g2 = (Graphics2D) g.create();
-            g2.setComposite(AlphaComposite.SrcOver.derive(Math.min(1f, alpha * alpha)));
-            g2.drawImage(snap, 0, 0, null);
-            g2.dispose();
+        if (!anim) { super.paint(g); return; }
+        float p = Math.min(1f, (System.nanoTime() - t0) / (DUR_MS * 1e6f));
+        float e = 1f - (1f - p) * (1f - p) * (1f - p) * (1f - p);   // easeOutQuart: швидкий старт, довге м'яке гальмування
+        float aOld = 1f - Math.min(1f, p / 0.6f);                    // стара сторінка зникає в першій частині руху
+        aOld *= aOld;
+        Graphics2D g2 = (Graphics2D) g.create();
+        g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        if (aOld > 0.01f) {
+            g2.setComposite(AlphaComposite.SrcOver.derive(aOld));
+            g2.drawImage(oldImg, 0, Math.round(-6 * e), null);
         }
+        g2.setComposite(AlphaComposite.SrcOver.derive(Math.max(0f, Math.min(1f, e))));
+        g2.drawImage(newImg, 0, Math.round(SLIDE * (1f - e)), null);
+        g2.dispose();
     }
 }

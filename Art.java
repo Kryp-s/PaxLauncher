@@ -222,7 +222,18 @@ final class Art {
     @SuppressWarnings("unchecked")
     private static final java.lang.ref.SoftReference<java.awt.image.BufferedImage>[] CACHE = new java.lang.ref.SoftReference[DATA.length];
 
+    private static final java.awt.image.BufferedImage[] HOLD = new java.awt.image.BufferedImage[DATA.length];
+
+    // Розкодовує всі вбудовані зображення у фоні одразу після запуску, щоб перший показ не підвисав.
+    static void preload() {
+        Thread t = new Thread(() -> { for (int i = 0; i < DATA.length; i++) get(i); }, "art-preload");
+        t.setDaemon(true);
+        t.setPriority(Thread.NORM_PRIORITY - 1);
+        t.start();
+    }
+
     static synchronized java.awt.image.BufferedImage get(int i) {
+        if (HOLD[i] != null) return HOLD[i];
         java.awt.image.BufferedImage im = CACHE[i] == null ? null : CACHE[i].get();
         if (im == null) {
             try {
@@ -233,6 +244,7 @@ final class Art {
             }
             CACHE[i] = new java.lang.ref.SoftReference<>(im);
         }
+        HOLD[i] = im;
         return im;
     }
 
@@ -247,8 +259,8 @@ final class Art {
     }
 
     private static final java.util.LinkedHashMap<java.util.List<Object>, java.lang.ref.SoftReference<java.awt.image.BufferedImage>> COVERS =
-            new java.util.LinkedHashMap<>(4, 0.75f, true) {
-                @Override protected boolean removeEldestEntry(Map.Entry<java.util.List<Object>, java.lang.ref.SoftReference<java.awt.image.BufferedImage>> e) { return size() > 2; }
+            new java.util.LinkedHashMap<>(8, 0.75f, true) {
+                @Override protected boolean removeEldestEntry(Map.Entry<java.util.List<Object>, java.lang.ref.SoftReference<java.awt.image.BufferedImage>> e) { return size() > 6; }
             };
 
     static void coverCached(Graphics2D g, java.awt.image.BufferedImage im, int x, int y, int w, int h, double focusY) {

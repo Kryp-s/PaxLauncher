@@ -57,14 +57,18 @@ final class Accounts {
         this.http = http;
         if (Files.exists(file)) {
             try (Reader r = Files.newBufferedReader(file, StandardCharsets.UTF_8)) { p.load(r); } catch (IOException ignored) { }
+            Vault.decryptAll(p);
+            if (Vault.available() && Vault.hasPlain(p)) save();
         }
     }
 
     private void save() {
         try {
-            Files.createDirectories(file.getParent());
-            try (Writer w = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) { p.store(w, "PaxLauncher accounts"); }
-        } catch (IOException ignored) { }
+            Properties out = new Properties();
+            out.putAll(p);
+            Vault.encryptAll(out);
+            Vault.writeProps(file, out, "PaxLauncher accounts", true);
+        } catch (IOException e) { PaxLauncher.warn("не вдалося зберегти акаунти", e); }
     }
 
     static Acc offline(String name) {
@@ -186,7 +190,7 @@ final class Accounts {
 
     private final Map<String, java.awt.image.BufferedImage> heads = new ConcurrentHashMap<>();
 
-    private Path headFile(String uuid) { return file.getParent().resolve("heads").resolve(uuid + ".png"); }
+    private Path headFile(String uuid) { return file.getParent().resolve("heads").resolve(uuid.replaceAll("[^0-9A-Za-z]", "") + ".png"); }
 
     java.awt.image.BufferedImage headCached(String uuid) {
         if (uuid == null || uuid.isEmpty()) return null;
@@ -222,11 +226,19 @@ final class Accounts {
 
     private java.awt.image.BufferedImage headFromUrl(String uuid, String url) {
         try {
-            HttpRequest rq = HttpRequest.newBuilder(URI.create(url)).header("User-Agent", "PaxLauncher/1.0")
+            URI u = URI.create(url);
+            String host = u.getHost() == null ? "" : u.getHost().toLowerCase();
+            if (!(host.equals("minecraft.net") || host.endsWith(".minecraft.net") || host.endsWith(".ely.by"))) return null;
+            if ("http".equalsIgnoreCase(u.getScheme())) u = URI.create("https" + url.substring(4));   // Mojang досі віддає http://textures…
+            else if (!"https".equalsIgnoreCase(u.getScheme())) return null;
+            HttpRequest rq = HttpRequest.newBuilder(u).header("User-Agent", "PaxLauncher/1.0")
                     .timeout(Duration.ofSeconds(20)).GET().build();
-            HttpResponse<byte[]> x = http.send(rq, HttpResponse.BodyHandlers.ofByteArray());
-            if (x.statusCode() != 200) return null;
-            java.awt.image.BufferedImage sk = javax.imageio.ImageIO.read(new ByteArrayInputStream(x.body()));
+            HttpResponse<java.io.InputStream> x = http.send(rq, HttpResponse.BodyHandlers.ofInputStream());
+            if (x.statusCode() != 200) { x.body().close(); return null; }
+            byte[] body;
+            try (java.io.InputStream in = x.body()) { body = in.readNBytes(2_000_001); }
+            if (body.length > 2_000_000) return null;
+            java.awt.image.BufferedImage sk = ModApi.readImage(body);
             if (sk == null || sk.getWidth() < 64) return null;
             int k = sk.getWidth() / 64;
             java.awt.image.BufferedImage out = new java.awt.image.BufferedImage(8, 8, java.awt.image.BufferedImage.TYPE_INT_ARGB);

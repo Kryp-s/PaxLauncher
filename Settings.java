@@ -53,8 +53,7 @@ final class Settings {
 
     void save() {
         try {
-            Files.createDirectories(file.getParent());
-            try (Writer w = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) { p.store(w, "PaxLauncher"); }
-        } catch (IOException ignored) { }
+            Vault.writeProps(file, p, "PaxLauncher", false);
+        } catch (IOException e) { PaxLauncher.warn("не вдалося зберегти налаштування", e); }
     }
 }

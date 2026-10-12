@@ -60,6 +60,33 @@ public class PaxLauncher {
         return now;
     }
 
+    /** Помилки, які раніше глухли: пишемо у error.log (до 100 КБ) у папці запускача. */
+    static void warn(String msg, Throwable t) {
+        try {
+            Files.createDirectories(ROOT);
+            Path lf = ROOT.resolve("error.log");
+            if (Files.exists(lf) && Files.size(lf) > 100_000) Files.delete(lf);
+            Files.writeString(lf, java.time.LocalDateTime.now() + " " + msg + (t == null ? "" : " — " + t) + "\n",
+                    StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (Exception ignored) { }
+    }
+
+    private static java.nio.channels.FileChannel lockCh;
+
+    /** Один запускач на користувача: два екземпляри псують спільні launcher.properties / accounts. */
+    static boolean singleInstance() {
+        try {
+            Files.createDirectories(ROOT);
+            lockCh = java.nio.channels.FileChannel.open(ROOT.resolve("launcher.lock"),
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            return lockCh.tryLock() != null;
+        } catch (java.nio.channels.OverlappingFileLockException e) {
+            return false;
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
     static final String[] LEAN_FLAGS = {
         "-XX:+IgnoreUnrecognizedVMOptions",
         "-XX:+UseSerialGC",
@@ -106,8 +133,21 @@ public class PaxLauncher {
             Path dir = ROOT.resolve("cache");
             Files.createDirectories(dir);
             Path jar = dir.resolve("PaxLauncher-lean.jar"), stamp = dir.resolve("PaxLauncher-lean.stamp");
-            String st = Files.size(src) + ":" + Files.getLastModifiedTime(src).toMillis() + ":" + Runtime.version();
-            if (Files.isRegularFile(jar) && Files.isRegularFile(stamp) && Files.readString(stamp).equals(st)) return jar;
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            try (var ls = Files.list(src.toAbsolutePath().getParent())) {
+                for (Path f : (Iterable<Path>) ls.filter(x -> x.toString().endsWith(".java")).sorted()::iterator) {
+                    md.update(f.getFileName().toString().getBytes(StandardCharsets.UTF_8));
+                    md.update((byte) 0);
+                    md.update(Files.readAllBytes(f));
+                    md.update((byte) 0);
+                }
+            }
+            String st = new java.math.BigInteger(1, md.digest()).toString(16) + ":" + Runtime.version();
+            // кеш-jar виконується при кожному старті: перевіряємо вміст і джерел, і самого jar, а не лише дату
+            if (Files.isRegularFile(jar) && Files.isRegularFile(stamp)) {
+                String[] sl = Files.readString(stamp).split("\n", 2);
+                if (sl.length == 2 && sl[0].equals(st) && sl[1].trim().equalsIgnoreCase(Engine.digest(jar, "SHA-256"))) return jar;
+            }
             JavaCompiler jc = ToolProvider.getSystemJavaCompiler();
             if (jc == null) return null;
             Path out = Files.createTempDirectory("paxc");
@@ -129,7 +169,7 @@ public class PaxLauncher {
                     }
                 }
                 Files.move(tmp, jar, StandardCopyOption.REPLACE_EXISTING);
-                Files.writeString(stamp, st);
+                Files.writeString(stamp, st + "\n" + Engine.digest(jar, "SHA-256"));
                 return jar;
             } finally {
                 try (var w = Files.walk(out)) { w.sorted(Comparator.reverseOrder()).forEach(f -> f.toFile().delete()); }
@@ -141,6 +181,11 @@ public class PaxLauncher {
 
     public static void main(String[] args) {
         if (relaunchLean()) { System.exit(0); return; }
+        if (!singleInstance()) {
+            JOptionPane.showMessageDialog(null, "PaxLauncher уже запущено.", "PaxLauncher", JOptionPane.INFORMATION_MESSAGE);
+            System.exit(0);
+            return;
+        }
         System.setProperty("awt.useSystemAAFontSettings", "on");
         System.setProperty("swing.aatext", "true");
         System.setProperty("sun.java2d.d3d", "false");
@@ -152,6 +197,10 @@ public class PaxLauncher {
         SwingUtilities.invokeLater(() -> {
             LauncherWindow w = new LauncherWindow();
             w.setVisible(true);
+            Vault.onInsecure = () -> SwingUtilities.invokeLater(() -> w.msg(
+                    "Не вдалося зашифрувати токени (PowerShell/DPAPI недоступні) — вони збережені відкритим текстом у accounts.properties. "
+                    + "Розблокуй PowerShell або вийди з акаунтів, якщо цей ПК не довірений."));
+            if (Vault.insecure) Vault.onInsecure.run();
             Updater.start(w, boot);
         });
     }

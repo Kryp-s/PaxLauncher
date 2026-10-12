@@ -32,11 +32,19 @@ import javax.swing.plaf.basic.*;
 
 final class Json {
     private final String s;
-    private int i;
+    private int i, depth;
+    private static final int MAX_DEPTH = 100;
 
     private Json(String s) { this.s = s; }
 
-    static Object parse(String text) { return new Json(text).val(); }
+    /** Кидає IllegalArgumentException (а не StackOverflowError / IndexOutOfBounds) на битому чи надто глибокому JSON. */
+    static Object parse(String text) {
+        try {
+            return new Json(text).val();
+        } catch (IndexOutOfBoundsException | NumberFormatException e) {
+            throw new IllegalArgumentException("bad JSON: " + e.getMessage(), e);
+        }
+    }
 
     private void ws() { while (i < s.length() && s.charAt(i) <= ' ') i++; }
 
@@ -54,26 +62,32 @@ final class Json {
         }
     }
 
+    private void enter() { if (++depth > MAX_DEPTH) throw new IllegalArgumentException("JSON too deep"); }
+
     private Map<String, Object> obj() {
+        enter();
         Map<String, Object> m = new LinkedHashMap<>();
         i++; ws();
-        if (s.charAt(i) == '}') { i++; return m; }
+        if (s.charAt(i) == '}') { i++; depth--; return m; }
         while (true) {
             ws(); String k = str(); ws(); i++;
             m.put(k, val()); ws();
             if (s.charAt(i++) == '}') break;
         }
+        depth--;
         return m;
     }
 
     private List<Object> arr() {
+        enter();
         List<Object> l = new ArrayList<>();
         i++; ws();
-        if (s.charAt(i) == ']') { i++; return l; }
+        if (s.charAt(i) == ']') { i++; depth--; return l; }
         while (true) {
             l.add(val()); ws();
             if (s.charAt(i++) == ']') break;
         }
+        depth--;
         return l;
     }
 

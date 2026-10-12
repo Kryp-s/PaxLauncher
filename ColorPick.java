@@ -34,6 +34,7 @@ final class ColorPick extends JComponent {
     private float h, s, v;
     private int drag;
     private final Rectangle sv = new Rectangle(0, 0, 280, 170), hb = new Rectangle(0, 184, 280, 16);
+    private static final int HPAD = 8;   // повзунок відтінку повністю всередині смуги
     Consumer<Color> onChange;
 
     ColorPick(Color c) {
@@ -67,7 +68,7 @@ final class ColorPick extends JComponent {
             s = cl((e.getX() - sv.x) / (float) sv.width);
             v = 1f - cl((e.getY() - sv.y) / (float) sv.height);
         } else if (drag == 2) {
-            h = cl((e.getX() - hb.x) / (float) hb.width);
+            h = cl((e.getX() - hb.x - HPAD) / (float) (hb.width - 2 * HPAD));
         } else return;
         repaint();
         if (onChange != null) onChange.accept(get());
@@ -83,7 +84,8 @@ final class ColorPick extends JComponent {
         g.fill(sv);
         g.setPaint(new GradientPaint(0, sv.y, new Color(0, 0, 0, 0), 0, sv.y + sv.height, Color.BLACK));
         g.fill(sv);
-        g.setClip(null);
+        // Кружок малюємо лише всередині області, яку компонент повністю перезафарбовує на кожному кадрі.
+        // Інакше біля країв (вікно напівпрозоре, фон не очищується) лишаються «клони» кружка.
         int kx = sv.x + Math.round(s * sv.width), ky = sv.y + Math.round((1f - v) * sv.height);
         g.setStroke(new BasicStroke(2f));
         g.setColor(new Color(0, 0, 0, 110));
@@ -96,14 +98,14 @@ final class ColorPick extends JComponent {
             g.setColor(Color.getHSBColor(x / (float) hb.width, 1f, 1f));
             g.fillRect(hb.x + x, hb.y, 1, hb.height);
         }
-        g.setClip(null);
-        int hx = hb.x + Math.round(h * hb.width), hy = hb.y + hb.height / 2;
+        int hx = hb.x + HPAD + Math.round(h * (hb.width - 2 * HPAD)), hy = hb.y + hb.height / 2;
         g.setColor(new Color(0, 0, 0, 90));
-        g.fillOval(hx - 9, hy - 8, 18, 18);
+        g.fillOval(hx - 7, hy - 6, 14, 14);
         g.setColor(Color.WHITE);
-        g.fillOval(hx - 9, hy - 9, 18, 18);
+        g.fillOval(hx - 7, hy - 7, 14, 14);
         g.setColor(Color.getHSBColor(h, 1f, 1f));
-        g.fillOval(hx - 6, hy - 6, 12, 12);
+        g.fillOval(hx - 4, hy - 4, 8, 8);
+        g.setClip(null);
         g.dispose();
     }
 }

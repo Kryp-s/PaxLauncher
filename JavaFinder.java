@@ -69,7 +69,8 @@ final class JavaFinder {
                 home = exe.getParent().getParent().toRealPath().toString();
             }
         } catch (Exception ignored) { }
-        if (ver.isEmpty() || home.isEmpty()) {
+        // Не запускаємо невідомі java.exe, які поточний користувач може підмінити (без файлу release) — лише читаємо метадані.
+        if ((ver.isEmpty() || home.isEmpty()) && !Files.isWritable(exe)) {
             try {
                 Process pr = new ProcessBuilder(exe.toString(), "-XshowSettings:properties", "-version").redirectErrorStream(true).start();
                 String out = new String(pr.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
@@ -109,6 +110,7 @@ final class JavaFinder {
         }
 
         List<Path> roots = new ArrayList<>();
+        roots.add(PaxLauncher.ROOT.resolve("runtime"));
         if (win) {
             for (String e : new String[]{"ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "LOCALAPPDATA"}) {
                 String b = System.getenv(e);
