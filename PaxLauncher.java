@@ -70,21 +70,6 @@ public class PaxLauncher {
         } catch (Exception ignored) { }
     }
 
-    private static java.nio.channels.FileChannel lockCh;
-
-    static boolean singleInstance() {
-        try {
-            Files.createDirectories(ROOT);
-            lockCh = java.nio.channels.FileChannel.open(ROOT.resolve("launcher.lock"),
-                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-            return lockCh.tryLock() != null;
-        } catch (java.nio.channels.OverlappingFileLockException e) {
-            return false;
-        } catch (Exception e) {
-            return true;
-        }
-    }
-
     static final String[] LEAN_FLAGS = {
         "-XX:+IgnoreUnrecognizedVMOptions",
         "-XX:+UseSerialGC",
@@ -178,11 +163,6 @@ public class PaxLauncher {
 
     public static void main(String[] args) {
         if (relaunchLean()) { System.exit(0); return; }
-        if (!singleInstance()) {
-            JOptionPane.showMessageDialog(null, "PaxLauncher уже запущено.", "PaxLauncher", JOptionPane.INFORMATION_MESSAGE);
-            System.exit(0);
-            return;
-        }
         System.setProperty("awt.useSystemAAFontSettings", "on");
         System.setProperty("swing.aatext", "true");
         System.setProperty("sun.java2d.d3d", "false");

@@ -942,7 +942,11 @@ final class Engine {
                     Path out = nd.resolve(ze.getName()).normalize();
                     if (!out.startsWith(nd)) continue;
                     Files.createDirectories(out.getParent());
-                    Files.copy(z, out, StandardCopyOption.REPLACE_EXISTING);
+                    try {
+                        Files.copy(z, out, StandardCopyOption.REPLACE_EXISTING);
+                    } catch (IOException busy) {
+                        if (!Files.exists(out)) throw busy;
+                    }
                 }
             }
         }

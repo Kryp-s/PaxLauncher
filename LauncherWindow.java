@@ -56,8 +56,12 @@ final class LauncherWindow extends JFrame {
     final Bar bar = new Bar();
     final JLabel status = label(I18n.t("Готово до запуску"), 13, false, Theme.MUTED);
     final Btn playBtn = new Btn(I18n.t("Грати"), Btn.Kind.PRIMARY);
+    final Set<String> running = ConcurrentHashMap.newKeySet();
+
+    static String accKey(Accounts.Acc a) { return a.type() + ":" + a.name() + ":" + a.uuid(); }
     final Btn loadersBtn = new Btn(I18n.t("Додати версію"), Btn.Kind.SECONDARY);
-    boolean filling, busy;
+    boolean filling;
+    volatile boolean busy;
 
     final Combo<String> lMc = new Combo<>(), lType = new Combo<>();
     final Combo<Engine.LV> lVer = new Combo<>();
@@ -771,7 +775,11 @@ final class LauncherWindow extends JFrame {
         wt.start();
     }
 
+    boolean pageShown;
+
     void showPage(String key) {
+        if (pageShown && key.equals(curPage)) return;
+        pageShown = true;
         if (!key.equals("settings") && curPage.equals("settings")) {
             if (themeDirty) revertTheme();
             reloadSettingsForm();
@@ -1835,10 +1843,18 @@ final class LauncherWindow extends JFrame {
 
     void setBusy(boolean b) {
         busy = b;
-        playBtn.setEnabled(!b);
         loadersBtn.setEnabled(!b);
         lInstall.setEnabled(!b && lVer.getItemCount() > 0);
-        playBtn.setText(b ? I18n.t("Зачекай…") : I18n.t("Грати"));
+        refreshPlayText();
+    }
+
+    final AtomicInteger games = new AtomicInteger();
+
+    void refreshPlayText() {
+        Accounts.Acc cur = accounts == null ? null : accounts.current();
+        boolean curRunning = cur != null && running.contains(accKey(cur));
+        playBtn.setEnabled(!busy && !curRunning);
+        playBtn.setText(busy ? I18n.t("Зачекай…") : curRunning ? I18n.t("Гра запущена") : I18n.t("Грати"));
     }
 
     JPanel loadersPage() {
@@ -3511,6 +3527,7 @@ final class LauncherWindow extends JFrame {
         if (avatarBtn != null) avatarBtn.repaint();
         getContentPane().repaint();
         welcomeLbl.setText(a == null ? I18n.t("Ласкаво просимо!") : I18n.t("Ласкаво просимо, ") + a.name() + "!");
+        refreshPlayText();
     }
 
     void loadHeadAsync(Accounts.Acc a) {
@@ -3940,6 +3957,7 @@ final class LauncherWindow extends JFrame {
         Object o = versions.getSelectedItem();
         if (!(o instanceof VItem)) { msg(I18n.t("Спочатку обери версію гри.")); return; }
         VItem it = (VItem) o;
+        if (running.contains(accKey(acc))) return;
         saveVersion();
         setBusy(true);
         bar.set(0);
@@ -3948,6 +3966,7 @@ final class LauncherWindow extends JFrame {
         boolean hide = hideC.isSelected();
         Engine.Progress pg = (t, f) -> SwingUtilities.invokeLater(() -> { status.setText(t); bar.set(f); });
 
+        final boolean[] started = {false}, ended = {false};
         new Thread(() -> {
             try {
                 pg.update(I18n.t("Запуск: ") + it.id() + " (" + Engine.detectLoader(it.id()) + ")…", 0);
@@ -3963,12 +3982,15 @@ final class LauncherWindow extends JFrame {
                 if (a.token().length() > 3) line = line.replace(a.token(), "***");
                 log(I18n.t("Запуск: ") + (line.length() > 500 ? line.substring(0, 500) + " …" : line));
                 Process pr = new ProcessBuilder(cmd).directory(gd.toFile()).redirectErrorStream(true).start();
+                started[0] = true;
+                running.add(accKey(acc));
                 if (it.profile() == null) noteSession(it.id(), gd);
                 pg.update(I18n.t("Гра запущена. Приємної гри!"), 1);
-                SwingUtilities.invokeLater(() -> cancelUi(false, cancelBtn, pauseBtn));
+                games.incrementAndGet();
+                inGame = true;
+                SwingUtilities.invokeLater(() -> { setBusy(false); cancelUi(false, cancelBtn, pauseBtn); });
                 String mcv = Json.string(v.get("_jar")) != null ? Json.string(v.get("_jar")) : it.id();
                 String ld = Engine.detectLoader(it.id());
-                inGame = true;
                 rpc.update("Minecraft " + mcv,
                         ld + (it.profile() != null ? I18n.t(" · збірка «") + it.profile() + "»" : ""),
                         System.currentTimeMillis() / 1000);
@@ -3979,9 +4001,11 @@ final class LauncherWindow extends JFrame {
                 }
                 int code = pr.waitFor();
                 log(I18n.t("Гра завершилась з кодом ") + code);
-                inGame = false;
-                presenceIdle();
-                pg.update(code == 0 ? " " : I18n.t("Гра завершилась з помилкою (код ") + code + I18n.t("), дивись Консоль"), 0);
+                inGame = games.decrementAndGet() > 0;
+                running.remove(accKey(acc));
+                ended[0] = true;
+                if (!inGame) presenceIdle();
+                if (!busy) pg.update(code == 0 ? " " : I18n.t("Гра завершилась з помилкою (код ") + code + I18n.t("), дивись Консоль"), 0);
             } catch (Engine.Cancelled cx) {
                 log(I18n.t("Завантаження скасовано"));
                 SwingUtilities.invokeLater(() -> { status.setText(I18n.t("Завантаження скасовано")); bar.set(0); });
@@ -3995,7 +4019,13 @@ final class LauncherWindow extends JFrame {
                     msg(I18n.t("Не вдалося запустити гру:\n") + ex.getMessage());
                 });
             } finally {
-                SwingUtilities.invokeLater(() -> { setVisible(true); setBusy(false); cancelUi(false, cancelBtn, pauseBtn); });
+                if (started[0] && !ended[0]) { inGame = games.decrementAndGet() > 0; running.remove(accKey(acc)); }
+                final boolean st = started[0];
+                SwingUtilities.invokeLater(() -> {
+                    setVisible(true);
+                    if (st) refreshPlayText();
+                    else { setBusy(false); cancelUi(false, cancelBtn, pauseBtn); }
+                });
             }
         }, "launch").start();
     }
