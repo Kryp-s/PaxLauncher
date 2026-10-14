@@ -57,8 +57,9 @@ final class Accounts {
         this.http = http;
         if (Files.exists(file)) {
             try (Reader r = Files.newBufferedReader(file, StandardCharsets.UTF_8)) { p.load(r); } catch (IOException ignored) { }
+            Vault.restrict(file);
             Vault.decryptAll(p);
-            if (Vault.available() && Vault.hasPlain(p)) save();
+            if (Vault.hasPlain(p) && Vault.available()) save();
         }
     }
 

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PaxLauncher
+GenericName=Minecraft Launcher
+Comment=Український лаунчер Minecraft
+Exec=@EXEC@
+Icon=@ICON@
+Terminal=false
+Categories=Game;
+StartupWMClass=PaxLauncher

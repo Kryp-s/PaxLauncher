@@ -69,6 +69,7 @@ final class CurseForge {
                 try {
                     Path f = eng.root.resolve("curseforge.key");
                     if (Files.isRegularFile(f) && Files.size(f) < 256) {
+                        Vault.restrict(f);
                         String t = Files.readString(f, StandardCharsets.UTF_8).trim();
                         if (validKey(t)) k = t;
                     }

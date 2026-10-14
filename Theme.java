@@ -178,7 +178,23 @@ final class Theme {
     }
     static final String DISCORD_ID = "1558210355229106416";
 
-    private static final Font BASE_FONT = new Font("Segoe UI", Font.PLAIN, 14);
+    private static final Font BASE_FONT = pickBaseFont();
+
+    /** Перший встановлений шрифт зі списку, який вміє малювати кирилицю (на Linux «Segoe UI» немає, а запасний шрифт може бути без кирилиці). */
+    private static Font pickBaseFont() {
+        String sample = "Привіт їєґ Ыё ABC abc 123";
+        try {
+            Set<String> have = new HashSet<>(Arrays.asList(
+                    GraphicsEnvironment.getLocalGraphicsEnvironment().getAvailableFontFamilyNames()));
+            for (String n : new String[]{"Segoe UI", "Inter", "Noto Sans", "DejaVu Sans", "Liberation Sans", "Ubuntu",
+                    "Cantarell", "Roboto", "Open Sans", "Arial", "Helvetica", "FreeSans", "Verdana", "Tahoma"}) {
+                if (!have.contains(n)) continue;
+                Font f = new Font(n, Font.PLAIN, 14);
+                if (f.canDisplayUpTo(sample) == -1) return f;
+            }
+        } catch (Throwable ignored) { }
+        return new Font(Font.SANS_SERIF, Font.PLAIN, 14);
+    }
     private static final Map<Long, Font> FONTS = new ConcurrentHashMap<>();
 
     static Font font(int style, float size) { return fontRaw(style, (float) (size * S)); }

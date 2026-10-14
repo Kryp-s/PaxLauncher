@@ -2136,8 +2136,6 @@ final class LauncherWindow extends JFrame {
         ModApi.Kind k = curKind();
         setModInfo(k.isMod() && p.loader().equals("Vanilla")
                 ? I18n.t("Чиста збірка не підтримує моди. Створи збірку на основі Fabric / Quilt / Forge / NeoForge (набори ресурсів працюють і в чистій).")
-                : k == ModApi.Kind.WORLD
-                ? I18n.t("Мапи беруться з CurseForge (на Modrinth їх немає) й розпаковуються в папку saves цієї збірки. Наявні світи не перезаписуються.")
                 : k == ModApi.Kind.SHADER
                 ? I18n.t("Шейдерам потрібен мод Iris (Fabric / Quilt / NeoForge) або OptiFine — встанови його в цю збірку на вкладці «Моди».")
                 : null);
@@ -3043,13 +3041,14 @@ final class LauncherWindow extends JFrame {
         }, "mod-install").start();
     }
 
-    /** Одна кнопка імпорту: у вікні обирається, що саме переносимо — моди чи набори ресурсів. */
+    /** Одна кнопка імпорту: у вікні обирається, що саме переносимо — моди, набори ресурсів чи шейдери. */
     void importChooser() {
         if (curProf() == null) { msg(I18n.t("Спочатку створи збірку («Нова збірка»).")); return; }
         if (mBusy) return;
         Combo<ModApi.Kind> what = new Combo<>();
         what.addItem(ModApi.Kind.MOD);
         what.addItem(ModApi.Kind.PACK);
+        what.addItem(ModApi.Kind.SHADER);
         what.setPreferredSize(new Dimension(Theme.px(320), Theme.px(44)));
         JPanel box = new JPanel();
         box.setOpaque(false);

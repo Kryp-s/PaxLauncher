@@ -50,7 +50,8 @@ final class Updater {
 
     static boolean installedBuild() {
         try {
-            if (!Engine.osName().equals("windows")) { log("пропуск: автооновлення працює лише у Windows"); return false; }
+            String os = Engine.osName();
+            if (!os.equals("windows") && !os.equals("linux")) { log("пропуск: автооновлення працює лише у Windows і Linux"); return false; }
             var cs = PaxLauncher.class.getProtectionDomain().getCodeSource();
             if (cs == null || cs.getLocation() == null) { log("пропуск: невідомий шлях запуску"); return false; }
             Path loc = Path.of(cs.getLocation().toURI());
@@ -89,14 +90,19 @@ final class Updater {
                 String low = name.toLowerCase();
                 boolean msi = low.endsWith(".msi");
                 boolean exe = low.endsWith(".exe") && !low.contains("portable");
-                if (!msi && !exe) continue;
+                if (Engine.osName().equals("linux")) {
+                    // каталог встановлення доступний для запису (tar.gz у ~/.local) -> tar.gz, інакше (.deb у /opt) -> .deb
+                    boolean tgz = low.endsWith(".tar.gz") && low.contains("linux");
+                    boolean deb = low.endsWith(".deb");
+                    if (!(Files.isWritable(appRoot()) ? tgz : deb)) continue;
+                } else if (!msi && !exe) continue;
                 String dg = Json.string(Json.get(a, "digest"));
                 String sha = dg != null && dg.startsWith("sha256:") ? dg.substring(7) : null;
                 Release r = new Release(v, url, name, sha);
                 if (msi) return r;
                 if (best == null) best = r;
             }
-            if (best == null) log("у релізі " + tag + " немає інсталятора (.msi або .exe)");
+            if (best == null) log("у релізі " + tag + " немає інсталятора для цієї системи (.msi/.exe, .tar.gz/.deb для Linux)");
             else log("знайдено оновлення " + v + ": " + best.file());
             return best;
         } catch (Throwable e) {
@@ -130,27 +136,11 @@ final class Updater {
         try { return d.isEmpty() ? 0 : Integer.parseInt(d); } catch (NumberFormatException e) { return 0; }
     }
 
-    static final int COUNTDOWN = 7;
-
-    private static String countdownText(Release r, int sec) {
-        return I18n.t("Знайдено нову версію ") + r.version()
-                + I18n.t(". Запускач закриється через ") + sec + I18n.t(" с і встановить оновлення.");
-    }
-
     static void apply(LauncherWindow win, Release r) {
-        int[] left = {COUNTDOWN};
-        boolean[] auto = {false};
-        JLabel msg = Dlg.text(countdownText(r, left[0]));
-        boolean now = Dlg.show(win, I18n.t("Оновлення"), msg, I18n.t("Оновити зараз"), I18n.t("Пізніше"), d -> {
-            javax.swing.Timer tm = new javax.swing.Timer(1000, null);
-            tm.addActionListener(e -> {
-                if (!d.isDisplayable()) { tm.stop(); return; }
-                if (--left[0] <= 0) { tm.stop(); auto[0] = true; d.dispose(); }
-                else msg.setText(Dlg.text(countdownText(r, left[0])).getText());
-            });
-            tm.start();
-        });
-        if (!now && !auto[0]) { log("користувач відклав оновлення " + r.version()); return; }
+        boolean now = Dlg.show(win, I18n.t("Оновлення"),
+                Dlg.text(I18n.t("Знайдено нову версію ") + r.version() + I18n.t(". Оновити запускач зараз?")),
+                I18n.t("Оновити зараз"), I18n.t("Пізніше"));
+        if (!now) { log("користувач відклав оновлення " + r.version()); return; }
         install(win, r);
     }
 
@@ -180,7 +170,43 @@ final class Updater {
                 });
     }
 
+    static Path installDir() {
+        try {
+            var cs = PaxLauncher.class.getProtectionDomain().getCodeSource();
+            Path p = Path.of(cs.getLocation().toURI());
+            return Files.isDirectory(p) ? p : p.getParent();
+        } catch (Exception e) {
+            return Path.of(".");
+        }
+    }
+
+    /** Корінь jpackage app-image: <корінь>/lib/app/PaxLauncher.jar -> <корінь> */
+    static Path appRoot() {
+        Path d = installDir(), r = d.getParent() != null ? d.getParent().getParent() : null;
+        return r != null ? r : d;
+    }
+
+    private static String sh(Path p) {
+        return "'" + p.toString().replace("'", "'\\''") + "'";
+    }
+
+    /** Linux: .deb ставиться через pkexec dpkg -i; .tar.gz розпаковується поверх поточної папки й запускач стартує знову. */
+    static void runLinux(Path f) throws IOException {
+        String n = f.getFileName().toString().toLowerCase();
+        String script;
+        if (n.endsWith(".deb")) {
+            script = "pkexec dpkg -i " + sh(f) + " && /opt/paxlauncher/bin/PaxLauncher";
+        } else {
+            Path dir = appRoot();
+            script = "sleep 1; T=$(mktemp -d) && tar -xzf " + sh(f) + " -C \"$T\" --strip-components=1"
+                    + " && cp -rf --remove-destination \"$T\"/. " + sh(dir) + "/ ; rm -rf \"$T\"; exec " + sh(dir.resolve("bin").resolve("PaxLauncher"));
+        }
+        new ProcessBuilder("setsid", "sh", "-c", script)
+                .redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
+    }
+
     static void runInstaller(Path f) throws IOException {
+        if (Engine.osName().equals("linux")) { runLinux(f); return; }
         if (f.getFileName().toString().toLowerCase().endsWith(".msi")) {
             new ProcessBuilder("msiexec", "/i", f.toString(), "/passive", "/norestart").start();
             return;

@@ -345,7 +345,7 @@ final class Engine {
                     }
                 }
             } else {
-                Process pr = new ProcessBuilder("tar", "-xzf", part.toString(), "-C", tmp.toString()).redirectErrorStream(true).start();
+                Process pr = new ProcessBuilder("tar", "--no-same-owner", "-xzf", part.toString(), "-C", tmp.toString()).redirectErrorStream(true).start();
                 pr.getInputStream().readAllBytes();
                 if (pr.waitFor() != 0) throw new IOException(I18n.t("Не вдалося розпакувати Java"));
             }
