@@ -54,7 +54,6 @@ jobs:
             --main-jar "$APP.jar"
             --main-class "$APP"
             --icon "build/$APP.png"
-            --license-file LICENSE
             --add-modules "$MODULES"
             --java-options "-Dfile.encoding=UTF-8"
           )
@@ -65,6 +64,7 @@ jobs:
 
           # 5. Пакет .deb
           jpackage --type deb "${COMMON[@]}" \
+            --license-file LICENSE \
             --linux-package-name paxlauncher \
             --linux-menu-group Game \
             --linux-app-category games \
