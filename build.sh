@@ -1,48 +1,97 @@
-#!/bin/bash
-# Linux-збірка, дзеркало Windows-воркфлоу: jpackage з вбудованим runtime (Java в системі не потрібна).
-# Результат: dist/PaxLauncher-<ver>-linux.tar.gz (портативний/без root) і dist/paxlauncher_<ver>*.deb
-# Потрібні: JDK 21 (javac, jar, jpackage), fakeroot, dpkg-deb. Запуск з кореня репо: packaging/linux/build.sh 1.0.16
+#!/usr/bin/env bash
+# PaxLauncher — збірка Linux-пакетів (.deb і .tar.gz).
+# Використання: packaging/linux/build.sh <версія>   (наприклад: 1.0.0)
+# Результат лягає в dist/ (звідти його забирає крок релізу в GitHub Actions).
+#
+# Потрібно: JDK 21+ (javac, jar, jpackage), fakeroot, dpkg-deb, python3-pil.
 set -euo pipefail
-VER="${1:?usage: build.sh <version>}"
-cd "$(dirname "$0")/../.."
-PK=packaging/linux
-OUT="$PWD/dist"; W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
-rm -rf "$OUT"; mkdir -p "$OUT" "$W/src" "$W/classes" "$W/input" "$W/img"
 
-# 1. компіляція (версія — у копії, як і у Windows)
-cp ./*.java "$W/src/"
-sed -i "s/static final String VERSION = \".*\";/static final String VERSION = \"$VER\";/" "$W/src/Updater.java"
-javac -encoding UTF-8 -d "$W/classes" "$W"/src/*.java
-jar cfe "$W/input/PaxLauncher.jar" PaxLauncher -C "$W/classes" .
-
-# 2. іконка PNG
-ICON="$PK/icon.png"
-if [ ! -f "$ICON" ]; then
-  python3 - "$W/icon.png" <<'PY'
-import sys
-from PIL import Image
-im = Image.open("icon.ico")
-im.size = max(im.info.get("sizes", {im.size}))
-im.convert("RGBA").resize((256, 256)).save(sys.argv[1])
-PY
-  ICON="$W/icon.png"
+VERSION="${1:-}"
+if [[ -z "$VERSION" ]]; then
+  echo "Використання: $0 <версія>" >&2
+  exit 2
+fi
+# jpackage (deb) вимагає версію, що починається з цифри: прибираємо префікс "v" і зайві символи
+VERSION="${VERSION#v}"
+DEB_VERSION="$(printf '%s' "$VERSION" | sed -E 's/[^0-9A-Za-z.+~-]/./g')"
+if [[ ! "$DEB_VERSION" =~ ^[0-9] ]]; then
+  echo "Версія '$VERSION' має починатися з цифри (очікується щось на кшталт 1.0.0)" >&2
+  exit 2
 fi
 
-# 3. app-image з вбудованим runtime (ті самі модулі, що й у Windows)
-MODS=java.desktop,java.net.http,java.management,java.logging,jdk.crypto.ec
-jpackage --type app-image --name PaxLauncher --app-version "$VER" --vendor "Kryp-s" \
-  --description "Ukrainian Minecraft launcher" --copyright "Kryp-s" \
-  --input "$W/input" --main-jar PaxLauncher.jar --main-class PaxLauncher \
-  --icon "$ICON" --add-modules "$MODS" --dest "$W/img"
+# Працюємо з кореня репозиторію, звідки б не запустили скрипт
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
 
-# 4. .deb з того самого app-image (ставиться в /opt/paxlauncher, ярлик у меню)
-jpackage --type deb --app-image "$W/img/PaxLauncher" --name PaxLauncher --linux-package-name paxlauncher \
-  --app-version "$VER" --vendor "Kryp-s" --linux-shortcut --linux-menu-group Game \
-  --linux-deb-maintainer "noreply@github.com" --linux-app-category games --dest "$OUT"
+APP_NAME="PaxLauncher"
+MAIN_CLASS="PaxLauncher"
+BUILD="$ROOT/build/linux"
+DIST="$ROOT/dist"
 
-# 5. tar.gz: той самий app-image + install.sh (встановлення в ~/.local без root)
-cp "$PK/install.sh" "$PK/PaxLauncher.desktop" "$W/img/PaxLauncher/"
-chmod +x "$W/img/PaxLauncher/install.sh"
-tar -C "$W/img" -czf "$OUT/PaxLauncher-$VER-linux.tar.gz" PaxLauncher
+for tool in javac jar jpackage python3; do
+  command -v "$tool" >/dev/null || { echo "Не знайдено '$tool' у PATH" >&2; exit 1; }
+done
+[[ -f icon.ico ]] || { echo "Не знайдено icon.ico у корені репозиторію" >&2; exit 1; }
+compgen -G "*.java" >/dev/null || { echo "Не знайдено *.java у корені репозиторію" >&2; exit 1; }
 
-ls -lh "$OUT"
+rm -rf "$BUILD"
+mkdir -p "$BUILD/classes" "$BUILD/input" "$DIST"
+
+echo "==> Компіляція"
+javac --release 21 -nowarn -encoding UTF-8 -d "$BUILD/classes" ./*.java
+
+echo "==> Пакування JAR"
+jar --create --file "$BUILD/input/$APP_NAME.jar" --main-class "$MAIN_CLASS" -C "$BUILD/classes" .
+
+echo "==> Іконка (icon.ico -> png)"
+python3 - "$ROOT/icon.ico" "$BUILD/$APP_NAME.png" <<'PY'
+import sys
+from PIL import Image
+
+src, dst = sys.argv[1], sys.argv[2]
+ico = Image.open(src)
+sizes = sorted(ico.info.get("sizes") or {ico.size}, key=lambda s: s[0] * s[1])
+ico.size = sizes[-1]          # беремо найбільший розмір із .ico
+img = ico.convert("RGBA")
+if img.size != (256, 256):
+    img = img.resize((256, 256), Image.LANCZOS)
+img.save(dst, "PNG")
+PY
+
+# Модулі, потрібні лаунчеру (Swing, HTTP-клієнт, TLS, керування процесами).
+# Вказані явно, бо jdeps не бачить модулі, що підтягуються через рефлексію.
+MODULES="java.base,java.desktop,java.net.http,java.management,java.logging,java.naming,java.prefs,java.xml,jdk.crypto.ec,jdk.unsupported,jdk.compiler"
+
+COMMON_ARGS=(
+  --name "$APP_NAME"
+  --app-version "$DEB_VERSION"
+  --vendor "Kryp-s"
+  --description "Український лаунчер Minecraft"
+  --input "$BUILD/input"
+  --main-jar "$APP_NAME.jar"
+  --main-class "$MAIN_CLASS"
+  --icon "$BUILD/$APP_NAME.png"
+  --license-file "$ROOT/LICENSE"
+  --add-modules "$MODULES"
+  --java-options "-Dfile.encoding=UTF-8"
+)
+
+echo "==> app-image -> .tar.gz"
+jpackage --type app-image "${COMMON_ARGS[@]}" --dest "$BUILD/app-image"
+tar -C "$BUILD/app-image" -czf "$DIST/$APP_NAME-$VERSION-linux-x64.tar.gz" "$APP_NAME"
+
+echo "==> .deb"
+if command -v fakeroot >/dev/null && command -v dpkg-deb >/dev/null; then
+  jpackage --type deb "${COMMON_ARGS[@]}" \
+    --linux-package-name paxlauncher \
+    --linux-menu-group "Game" \
+    --linux-app-category games \
+    --linux-shortcut \
+    --dest "$BUILD/deb"
+  cp "$BUILD"/deb/*.deb "$DIST/"
+else
+  echo "fakeroot або dpkg-deb не знайдено — .deb пропущено" >&2
+fi
+
+echo "==> Готово:"
+ls -lh "$DIST"
