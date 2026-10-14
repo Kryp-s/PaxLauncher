@@ -71,7 +71,6 @@ COMMON_ARGS=(
   --main-jar "$APP_NAME.jar"
   --main-class "$MAIN_CLASS"
   --icon "$BUILD/$APP_NAME.png"
-  --license-file "$ROOT/LICENSE"
   --add-modules "$MODULES"
   --java-options "-Dfile.encoding=UTF-8"
 )
@@ -83,6 +82,7 @@ tar -C "$BUILD/app-image" -czf "$DIST/$APP_NAME-$VERSION-linux-x64.tar.gz" "$APP
 echo "==> .deb"
 if command -v fakeroot >/dev/null && command -v dpkg-deb >/dev/null; then
   jpackage --type deb "${COMMON_ARGS[@]}" \
+    --license-file "$ROOT/LICENSE" \
     --linux-package-name paxlauncher \
     --linux-menu-group "Game" \
     --linux-app-category games \
