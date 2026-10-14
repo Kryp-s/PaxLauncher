@@ -1,0 +1,21 @@
+name: Release Linux
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - run: sudo apt-get update && sudo apt-get install -y fakeroot python3-pil
+      - name: Build Linux packages
+        run: packaging/linux/build.sh "${GITHUB_REF_NAME#v}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
