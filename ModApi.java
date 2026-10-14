@@ -33,16 +33,20 @@ import javax.swing.plaf.basic.*;
 final class ModApi {
     enum Kind {
         MOD("mod", "mods", I18n.t("Моди"), I18n.t("Пошук модів"), I18n.t("Встановлені моди"), I18n.t("Папка модів"),
-                I18n.t("Сторінка мода"), I18n.t("Видалити мод"), I18n.t("Версія мода (для цієї збірки)")),
+                I18n.t("Сторінка мода"), I18n.t("Видалити мод"), I18n.t("Версія мода (для цієї збірки)"), 6, "mc-mods"),
         PACK("resourcepack", "resourcepacks", I18n.t("Набори ресурсів"), I18n.t("Пошук наборів ресурсів"), I18n.t("Встановлені набори ресурсів"), I18n.t("Папка наборів ресурсів"),
-                I18n.t("Сторінка набору ресурсів"), I18n.t("Видалити набір ресурсів"), I18n.t("Версія набору ресурсів (для цієї збірки)")),
+                I18n.t("Сторінка набору ресурсів"), I18n.t("Видалити набір ресурсів"), I18n.t("Версія набору ресурсів (для цієї збірки)"), 12, "texture-packs"),
         SHADER("shader", "shaderpacks", I18n.t("Шейдери"), I18n.t("Пошук шейдерів"), I18n.t("Встановлені шейдери"), I18n.t("Папка шейдерів"),
-                I18n.t("Сторінка шейдера"), I18n.t("Видалити шейдер"), I18n.t("Версія шейдера (для цієї збірки)"));
+                I18n.t("Сторінка шейдера"), I18n.t("Видалити шейдер"), I18n.t("Версія шейдера (для цієї збірки)"), 6552, "shaders"),
+        WORLD("world", "saves", I18n.t("Мапи"), I18n.t("Пошук мап"), I18n.t("Встановлені мапи"), I18n.t("Папка мап"),
+                I18n.t("Сторінка мапи"), I18n.t("Видалити мапу"), I18n.t("Версія мапи (для цієї збірки)"), 17, "worlds");
 
-        final String type, folder, title, searchTitle, installedTitle, folderBtn, pageBtn, removeBtn, versionLabel;
+        final String type, folder, title, searchTitle, installedTitle, folderBtn, pageBtn, removeBtn, versionLabel, cfPath;
+        final int cfClass;
 
         Kind(String type, String folder, String title, String searchTitle, String installedTitle, String folderBtn,
-             String pageBtn, String removeBtn, String versionLabel) {
+             String pageBtn, String removeBtn, String versionLabel, int cfClass, String cfPath) {
+            this.cfClass = cfClass; this.cfPath = cfPath;
             this.type = type; this.folder = folder; this.title = title; this.searchTitle = searchTitle;
             this.installedTitle = installedTitle; this.folderBtn = folderBtn; this.pageBtn = pageBtn;
             this.removeBtn = removeBtn; this.versionLabel = versionLabel;
@@ -50,20 +54,48 @@ final class ModApi {
 
         boolean isMod() { return this == MOD; }
 
+        boolean isWorld() { return this == WORLD; }
+
+        /** Мапи на Modrinth відсутні — їх беруть лише з CurseForge. */
+        boolean onModrinth() { return this != WORLD; }
+
+        /** Що можна «переносити» (імпортувати) зі старих збірок: моди (.jar), набори ресурсів і шейдери (.zip). */
+        boolean importable() { return this != WORLD; }
+
         boolean matches(String fileName) {
             String n = fileName.toLowerCase(Locale.ROOT);
             if (n.endsWith(".disabled")) n = n.substring(0, n.length() - 9);
+            if (isWorld()) return !fileName.startsWith(".");
             return isMod() ? n.endsWith(".jar") : n.endsWith(".zip");
         }
 
         @Override public String toString() { return title; }
     }
 
+    enum Source {
+        MODRINTH("Modrinth"), CURSEFORGE("CurseForge");
+
+        final String label;
+
+        Source(String label) { this.label = label; }
+
+        @Override public String toString() { return label; }
+
+        static Source parse(String v) { return "CURSEFORGE".equalsIgnoreCase(v) ? CURSEFORGE : MODRINTH; }
+    }
+
     record Hit(Kind kind, String id, String slug, String title, String author, String desc,
                long downloads, String loaders, String iconUrl) {
         @Override public String toString() { return title; }
 
-        String pageUrl() { return "https://modrinth.com/" + kind.type + "/" + slug; }
+        Source source() { return CurseForge.isCf(id) ? Source.CURSEFORGE : Source.MODRINTH; }
+
+        String pageUrl() {
+            String sl = slug == null ? "" : slug.replaceAll("[^A-Za-z0-9._-]", "");
+            return source() == Source.CURSEFORGE
+                    ? "https://www.curseforge.com/minecraft/" + kind.cfPath + "/" + sl
+                    : "https://modrinth.com/" + kind.type + "/" + sl;
+        }
     }
 
     record Detail(String id, String title, String desc, String body, long downloads, long followers,
@@ -74,6 +106,11 @@ final class ModApi {
     Detail project(String id) throws Exception {
         Detail c = detailCache.get(id);
         if (c != null) return c;
+        if (CurseForge.isCf(id)) {
+            Detail cd = cf.project(id);
+            detailCache.put(id, cd);
+            return cd;
+        }
         Map<String, Object> h = m(Json.parse(get(MR + "/project/" + enc(id))));
         if (h == null) throw new IOException("bad project");
         Detail d = new Detail(str(h.get("id")), str(h.get("title")), str(h.get("description")), str(h.get("body")),
@@ -120,15 +157,18 @@ final class ModApi {
     final Engine eng;
     final Map<String, String> iconByProject = new ConcurrentHashMap<>();
 
-    ModApi(Engine eng) { this.eng = eng; }
+    final CurseForge cf;
+
+    ModApi(Engine eng) { this.eng = eng; this.cf = new CurseForge(this); }
 
     Map<String, String> iconUrls(Collection<String> ids) throws Exception {
         Map<String, String> out = new HashMap<>();
-        List<String> need = new ArrayList<>();
+        List<String> need = new ArrayList<>(), needCf = new ArrayList<>();
         for (String id : ids) {
             String c = iconByProject.get(id);
-            if (c != null) out.put(id, c); else need.add(id);
+            if (c != null) out.put(id, c); else if (CurseForge.isCf(id)) needCf.add(id); else need.add(id);
         }
+        if (!needCf.isEmpty()) { try { out.putAll(cf.logos(needCf)); } catch (IOException ignored) { } }
         for (int i = 0; i < need.size(); i += 50) {
             List<String> part = need.subList(i, Math.min(need.size(), i + 50));
             for (Object o : l(Json.parse(get(MR + "/projects?ids=" + enc(jsonArr(part)))))) {
@@ -235,6 +275,13 @@ final class ModApi {
 
     static BufferedImage embeddedIcon(Path file, Kind kind) {
         if (file == null) return null;
+        if (Files.isDirectory(file)) {
+            try {
+                Path ic = file.resolve("icon.png");
+                if (!Files.isRegularFile(ic) || Files.size(ic) > 8_000_000) return null;
+                return readImage(Files.readAllBytes(ic));
+            } catch (Throwable e) { return null; }
+        }
         try (java.util.zip.ZipFile z = new java.util.zip.ZipFile(file.toFile())) {
             List<String> cand = new ArrayList<>();
             if (kind.isMod()) {
@@ -348,44 +395,71 @@ final class ModApi {
         w.start();
     }
 
-    private static boolean mostlyCyrillic(String t) {
+    /** Текст уже мовою інтерфейсу (для української — кирилиця без суто російських літер). */
+    private static boolean alreadyTarget(String t) {
+        if (!"uk".equals(I18n.descLang())) return false;
         int cyr = 0, lat = 0;
         for (int i = 0; i < t.length(); i++) {
             char c = t.charAt(i);
+            if ("ыэъёЫЭЪЁ".indexOf(c) >= 0) return false;
             if (c >= '\u0400' && c <= '\u04FF') cyr++;
             else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) lat++;
         }
         return cyr > lat;
     }
 
+    void preloadTranslations() {
+        if (!trLoaded) loadTranslations();
+    }
+
     String cached(String text) {
         if (text == null) return "";
-        if (!trLoaded) loadTranslations();
         String c = trCache.get(text);
         return c != null ? c : text;
     }
 
-    static volatile boolean translateOn;
+    static volatile boolean translateOn = true;
 
     boolean needsTranslation(String text) {
         if (!trLoaded) loadTranslations();
-        return translateOn && I18n.descLang() != null && text != null && !text.isBlank() && !trCache.containsKey(text) && !mostlyCyrillic(text);
+        return translateOn && I18n.descLang() != null && text != null && !text.isBlank() && !trCache.containsKey(text) && !alreadyTarget(text);
     }
 
-    String translate(String text) {
-        if (I18n.descLang() == null) return text == null ? "" : text;
-        if (text == null || text.isBlank()) return text == null ? "" : text;
-        String c = trCache.get(text);
-        if (c != null) return c;
-        if (!translateOn) return text;
-        if (mostlyCyrillic(text)) { trCache.put(text, text); return text; }
-        if (System.currentTimeMillis() < trFailUntil) return text;
+    /** Ділить довгий текст на шматки (по абзацах і реченнях), щоб запит до перекладача не був задовгим. */
+    private static List<String> chunks(String text, int max) {
+        List<String> out = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        for (String line : text.split("(?<=\n)")) {
+            while (line.length() > max) {
+                int cut = line.lastIndexOf(". ", max);
+                if (cut < max / 3) cut = line.lastIndexOf(' ', max);
+                if (cut < max / 3) cut = max - 1;
+                String head = line.substring(0, cut + 1);
+                line = line.substring(cut + 1);
+                if (cur.length() + head.length() > max && cur.length() > 0) { out.add(cur.toString()); cur.setLength(0); }
+                cur.append(head);
+            }
+            if (cur.length() + line.length() > max && cur.length() > 0) { out.add(cur.toString()); cur.setLength(0); }
+            cur.append(line);
+        }
+        if (cur.length() > 0) out.add(cur.toString());
+        return out;
+    }
+
+    private static final class TrTemp extends IOException {
+        TrTemp(String m) { super(m); }
+    }
+
+    /** Один запит до перекладача. null — цей шматок перекласти неможливо (не повторювати); TrTemp — тимчасова помилка. */
+    private String translateChunk(String part) throws IOException {
         try {
-            String url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=" + I18n.descLang() + "&dt=t&q=" + enc(text);
+            String url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=" + I18n.descLang() + "&dt=t&q=" + enc(part);
             HttpRequest rq = HttpRequest.newBuilder(URI.create(url))
                     .header("User-Agent", "Mozilla/5.0 PaxLauncher/1.0").timeout(Duration.ofSeconds(10)).build();
             HttpResponse<String> r = eng.http.send(rq, HttpResponse.BodyHandlers.ofString());
-            if (r.statusCode() != 200) throw new IOException("HTTP " + r.statusCode());
+            int sc = r.statusCode();
+            if (sc == 429 || sc >= 500) throw new TrTemp("HTTP " + sc);
+            if (sc != 200) return null;
             List<Object> root = l(Json.parse(r.body()));
             StringBuilder sb = new StringBuilder();
             if (!root.isEmpty()) {
@@ -394,16 +468,49 @@ final class ModApi {
                     if (!sl.isEmpty() && sl.get(0) instanceof String) sb.append((String) sl.get(0));
                 }
             }
-            String out = sb.toString().trim();
-            if (out.isEmpty()) return text;
-            if (trCache.size() > 3000) trCache.clear();
-            trCache.put(text, out);
-            trDirty = true;
-            return out;
-        } catch (Exception e) {
-            trFailUntil = System.currentTimeMillis() + 20_000;
-            return text;
+            String out = sb.toString();
+            return out.isBlank() ? null : out;
+        } catch (TrTemp e) {
+            throw e;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new TrTemp("interrupted");
+        } catch (IOException e) {
+            throw new TrTemp(String.valueOf(e.getMessage()));
+        } catch (RuntimeException e) {
+            return null;
         }
+    }
+
+    String translate(String text) {
+        if (I18n.descLang() == null) return text == null ? "" : text;
+        if (text == null || text.isBlank()) return text == null ? "" : text;
+        String c = trCache.get(text);
+        if (c != null) return c;
+        if (!translateOn) return text;
+        if (alreadyTarget(text)) { trCache.put(text, text); return text; }
+        if (System.currentTimeMillis() < trFailUntil) return text;
+        StringBuilder all = new StringBuilder();
+        boolean any = false;
+        for (String part : chunks(text, 900)) {
+            if (part.isBlank()) { all.append(part); continue; }
+            String out = null;
+            try {
+                out = translateChunk(part);
+            } catch (TrTemp e) {
+                try { out = translateChunk(part); } catch (TrTemp e2) {
+                    trFailUntil = System.currentTimeMillis() + 5_000;
+                    return text;
+                } catch (IOException e2) { return text; }
+            } catch (IOException e) { return text; }
+            if (out == null) all.append(part); else { all.append(out); any = true; }
+        }
+        String res = any ? all.toString().trim() : text;
+        if (res.isEmpty()) res = text;
+        if (trCache.size() > 20000) trCache.clear();
+        trCache.put(text, res);
+        if (any) trDirty = true;
+        return res;
     }
 
     static List<String> modrinthLoaders(String loader) {
@@ -433,8 +540,10 @@ final class ModApi {
     private final Map<String, java.util.concurrent.CompletableFuture<List<Hit>>> searchCache = new ConcurrentHashMap<>();
     private final Map<String, Long> searchTime = new ConcurrentHashMap<>();
 
-    List<Hit> search(Kind kind, String q, String mc, String loader, int offset) throws Exception {
-        String key = kind.type + "|" + q + "|" + mc + "|" + loader + "|" + offset;
+    List<Hit> search(Source src, Kind kind, String q, String mc, String loader, int offset) throws Exception {
+        if (src == Source.MODRINTH && !kind.onModrinth())
+            throw new IOException(I18n.t("Цієї категорії на Modrinth немає — обери CurseForge."));
+        String key = src.name() + "|" + kind.type + "|" + q + "|" + mc + "|" + loader + "|" + offset;
         Long at = searchTime.get(key);
         if (at != null && System.currentTimeMillis() - at > 1_200_000) { searchCache.remove(key); searchTime.remove(key); }
         java.util.concurrent.CompletableFuture<List<Hit>> have = searchCache.get(key);
@@ -446,7 +555,7 @@ final class ModApi {
         java.util.concurrent.CompletableFuture<List<Hit>> prev = searchCache.putIfAbsent(key, mine);
         if (prev != null) {
             try { return new ArrayList<>(prev.get(40, java.util.concurrent.TimeUnit.SECONDS)); }
-            catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) { return searchNet(kind, q, mc, loader, offset); }
+            catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) { return searchNet(src, kind, q, mc, loader, offset); }
         }
         boolean first = offset == 0 && q.isEmpty();
         if (first) {
@@ -458,7 +567,7 @@ final class ModApi {
                 if (age[0] > 6 * 3600_000L) {
                     Thread t = new Thread(() -> {
                         try {
-                            List<Hit> fresh = searchNet(kind, q, mc, loader, 0);
+                            List<Hit> fresh = searchNet(src, kind, q, mc, loader, 0);
                             diskSave(key, fresh);
                             searchCache.put(key, java.util.concurrent.CompletableFuture.completedFuture(fresh));
                             searchTime.put(key, System.currentTimeMillis());
@@ -471,7 +580,7 @@ final class ModApi {
             }
         }
         try {
-            List<Hit> r = searchNet(kind, q, mc, loader, offset);
+            List<Hit> r = searchNet(src, kind, q, mc, loader, offset);
             if (first) diskSave(key, r);
             searchTime.put(key, System.currentTimeMillis());
             mine.complete(r);
@@ -538,9 +647,11 @@ final class ModApi {
 
     void warm() {
         try { get(MR + "/"); } catch (Throwable ignored) { }
+        try { cf.available(); } catch (Throwable ignored) { }
     }
 
-    private List<Hit> searchNet(Kind kind, String q, String mc, String loader, int offset) throws Exception {
+    private List<Hit> searchNet(Source src, Kind kind, String q, String mc, String loader, int offset) throws Exception {
+        if (src == Source.CURSEFORGE) return cf.search(kind, q, mc, loader, offset);
         StringBuilder f = new StringBuilder("[[\"project_type:" + kind.type + "\"],[\"versions:" + mc + "\"]");
         if (kind.isMod()) {
             List<String> cats = modrinthLoaders(loader);
@@ -569,6 +680,7 @@ final class ModApi {
     }
 
     List<ModFile> files(Kind kind, String id, String mc, String loader) throws Exception {
+        if (CurseForge.isCf(id)) return cf.files(kind, id, mc, loader);
         String url = MR + "/project/" + id + "/version?game_versions=" + enc("[\"" + mc + "\"]");
         if (kind.isMod()) {
             List<String> cats = modrinthLoaders(loader);
@@ -608,38 +720,87 @@ final class ModApi {
         boolean ok() { return reason == null; }
     }
 
+    static final long IMPORT_MAX_BYTES = 512L << 20;
+
+    static ModFile pickBest(List<ModFile> fs) {
+        for (ModFile x : fs) if (x.url() != null && x.channel().equals("release")) return x;
+        for (ModFile x : fs) if (x.url() != null) return x;
+        return null;
+    }
+
     ImportRow importJar(Path jar, String mc, String loader, Path dir, Set<String> seen,
                         Consumer<String> status, java.util.function.BooleanSupplier cancel) throws Exception {
-        String fn = jar.getFileName().toString();
+        return importFile(Kind.MOD, jar, mc, loader, dir, seen, status, cancel);
+    }
+
+    /**
+     * Перенесення чужого файлу (мод .jar / набір ресурсів .zip / шейдер .zip) у збірку:
+     * файл не копіюється «як є» — за його хешем шукається проєкт на Modrinth (а якщо нема — на CurseForge за відбитком),
+     * і з офіційного джерела ставиться версія, яка підходить саме цій збірці. Недовірені / невідомі файли пропускаються.
+     */
+    ImportRow importFile(Kind kind, Path file, String mc, String loader, Path dir, Set<String> seen,
+                         Consumer<String> status, java.util.function.BooleanSupplier cancel) throws Exception {
+        String fn = file.getFileName().toString();
         String title = fn;
         try {
-            if (modrinthLoaders(loader).isEmpty())
+            if (!kind.importable())
+                return new ImportRow(fn, title, I18n.t("цей тип не переноситься"));
+            if (kind.isMod() && modrinthLoaders(loader).isEmpty())
                 return new ImportRow(fn, title, I18n.t("у збірці без завантажувача моди не працюють"));
+            if (!Files.isRegularFile(file) || !kind.matches(fn))
+                return new ImportRow(fn, title, kind.isMod() ? I18n.t("це не файл .jar") : I18n.t("це не файл .zip"));
+            if (Files.size(file) > IMPORT_MAX_BYTES)
+                return new ImportRow(fn, title, I18n.t("файл завеликий (понад 512 МБ)"));
             status.accept(I18n.t("Пошук: ") + fn);
-            String hash = Engine.sha1(jar);
-            Map<String, Object> ver;
+            String hash = Engine.sha1(file);
+
+            String pid = null;
             try {
-                ver = m(Json.parse(get(MR + "/version_file/" + hash + "?algorithm=sha1")));
+                Map<String, Object> ver = m(Json.parse(get(MR + "/version_file/" + hash + "?algorithm=sha1")));
+                if (ver != null) pid = str(ver.get("project_id"));
             } catch (IOException e) {
-                if (String.valueOf(e.getMessage()).contains("404"))
-                    return new ImportRow(fn, title, I18n.t("не знайдено на Modrinth (власний мод або з іншого сайту) — постав вручну"));
-                throw e;
+                if (!String.valueOf(e.getMessage()).contains("404")) throw e;
             }
-            String pid = str(ver.get("project_id"));
-            if (pid.isEmpty()) return new ImportRow(fn, title, I18n.t("не вдалося визначити проєкт"));
-            try {
-                String t = str(m(Json.parse(get(MR + "/project/" + pid))).get("title"));
-                if (!t.isEmpty()) title = t;
-            } catch (IOException ignored) { }
-            List<ModFile> fs = files(Kind.MOD, pid, mc, loader);
-            if (fs.isEmpty())
-                return new ImportRow(fn, title, I18n.t("немає версії для Minecraft ") + mc + " (" + loader + ")");
+
             ModFile pick = null;
-            for (ModFile x : fs) if (x.url() != null && x.channel().equals("release")) { pick = x; break; }
-            if (pick == null) for (ModFile x : fs) if (x.url() != null) { pick = x; break; }
-            if (pick == null)
-                return new ImportRow(fn, title, I18n.t("автор заборонив завантаження сторонніми запускачами — візьми файл на сайті"));
-            install(Kind.MOD, pid, pick, mc, loader, dir, seen, false, status, cancel);
+            String useId = null;
+            boolean known = false;
+            if (pid != null && !pid.isEmpty()) {
+                known = true;
+                try {
+                    String t = str(m(Json.parse(get(MR + "/project/" + pid))).get("title"));
+                    if (!t.isEmpty()) title = t;
+                } catch (IOException ignored) { }
+                List<ModFile> fs = files(kind, pid, mc, loader);
+                pick = pickBest(fs);
+                if (pick != null) useId = pid;
+                else if (fs.isEmpty()) useId = null;
+                else useId = "";
+            }
+            if (pick == null && cf.available()) {
+                try {
+                    status.accept(I18n.t("Пошук на CurseForge: ") + fn);
+                    String cid = cf.identify(file);
+                    if (cid != null) {
+                        known = true;
+                        try { String t = cf.project(cid).title(); if (!t.isEmpty() && title.equals(fn)) title = t; } catch (IOException ignored) { }
+                        List<ModFile> fs = files(kind, cid, mc, loader);
+                        ModFile cp = pickBest(fs);
+                        if (cp != null) { pick = cp; useId = cid; }
+                        else if (!fs.isEmpty() && useId == null) useId = "";
+                    }
+                } catch (Engine.Cancelled c) {
+                    throw c;
+                } catch (IOException ignored) { }
+            }
+            if (!known)
+                return new ImportRow(fn, title, I18n.t("не знайдено на Modrinth / CurseForge (власний файл або з іншого сайту) — постав вручну"));
+            if (pick == null) {
+                if ("".equals(useId))
+                    return new ImportRow(fn, title, I18n.t("автор заборонив завантаження сторонніми запускачами — візьми файл на сайті"));
+                return new ImportRow(fn, title, I18n.t("немає версії для Minecraft ") + mc + (kind.isMod() ? " (" + loader + ")" : ""));
+            }
+            install(kind, useId, pick, mc, loader, dir, seen, false, status, cancel);
             return new ImportRow(pick.filename(), title, null);
         } catch (Engine.Cancelled c) {
             throw c;
@@ -718,6 +879,9 @@ final class ModApi {
         if (isDep && old != null && (Files.exists(dir.resolve(old)) || Files.exists(dir.resolve(old + ".disabled")))) return;
         if (f.url() == null) throw new IOException(I18n.t("Автор заборонив завантаження сторонніми запускачами — візьми файл на сайті."));
         if (f.sha1() == null) throw new IOException(I18n.t("Немає контрольної суми файлу — відмовляюсь завантажувати неперевірений файл."));
+        if (!trustedHost(f.url(), CurseForge.isCf(id)))
+            throw new IOException(I18n.t("Файл лежить на недовіреному сервері — відмовляюсь завантажувати."));
+        if (kind.isWorld()) { installWorld(key, f, dir, reg, status, cancel); return; }
         String fn = safeName(f.filename());
         child(dir, fn);
         status.accept((isDep ? I18n.t("Залежність: ") : I18n.t("Завантаження: ")) + fn);
@@ -748,6 +912,124 @@ final class ModApi {
             } catch (Exception e) {
                 eng.log.accept(I18n.t("Не вдалося поставити залежність ") + dep + ": " + e.getMessage());
             }
+        }
+    }
+
+    // ---------- безпека завантажень ----------
+
+    /** Файли дозволено брати лише з офіційних CDN: Modrinth (cdn.modrinth.com) та CurseForge (*.forgecdn.net). */
+    static boolean trustedHost(String url, boolean curse) {
+        try {
+            String h = URI.create(Engine.httpsOnly(url)).getHost().toLowerCase(Locale.ROOT);
+            if (curse) return h.equals("forgecdn.net") || h.endsWith(".forgecdn.net") || h.equals("curseforge.com") || h.endsWith(".curseforge.com");
+            return h.equals("modrinth.com") || h.endsWith(".modrinth.com");
+        } catch (Exception e) { return false; }
+    }
+
+    static void deleteTree(Path p) throws IOException {
+        if (p == null || !Files.exists(p, LinkOption.NOFOLLOW_LINKS)) return;
+        Files.walkFileTree(p, new SimpleFileVisitor<Path>() {
+            @Override public FileVisitResult visitFile(Path f, java.nio.file.attribute.BasicFileAttributes a) throws IOException {
+                Files.deleteIfExists(f);
+                return FileVisitResult.CONTINUE;
+            }
+            @Override public FileVisitResult postVisitDirectory(Path d, IOException e) throws IOException {
+                Files.deleteIfExists(d);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    // ---------- мапи ----------
+
+    private void installWorld(String key, ModFile f, Path saves, Properties reg, Consumer<String> status,
+                              java.util.function.BooleanSupplier cancel) throws Exception {
+        String zipName = safeName(f.filename());
+        if (!zipName.toLowerCase(Locale.ROOT).endsWith(".zip"))
+            throw new IOException(I18n.t("Мапа має бути архівом .zip"));
+        Path tmpZip = cacheDir("worlds").resolve(Long.toHexString(System.nanoTime()) + ".zip");
+        try {
+            status.accept(I18n.t("Завантаження: ") + zipName);
+            eng.download(f.url(), tmpZip, f.sha1(), cancel);
+            status.accept(I18n.t("Розпаковування: ") + zipName);
+            String folder = extractWorld(tmpZip, saves, zipName.substring(0, zipName.length() - 4), cancel);
+            reg.setProperty(key, folder);
+            saveReg(saves, reg);
+            eng.log.accept(I18n.t("Встановлено мапу: ") + folder);
+        } finally {
+            try { Files.deleteIfExists(tmpZip); } catch (IOException ignored) { }
+        }
+    }
+
+    static final int WORLD_MAX_ENTRIES = 100_000;
+    static final long WORLD_MAX_BYTES = 4L << 30;
+
+    /**
+     * Розпаковує мапу в saves/. Захист: шляхи з «..» / абсолютні відкидаються (zip-slip), ліміти на кількість файлів
+     * і розмір після розпакування (zip-bomb), наявні світи ніколи не перезаписуються (додається « (2)»), розпаковка
+     * йде у тимчасову папку й переноситься на місце лише повністю.
+     */
+    static String extractWorld(Path zip, Path saves, String fallbackName,
+                               java.util.function.BooleanSupplier cancel) throws IOException {
+        Files.createDirectories(saves);
+        Path tmp = null;
+        boolean done = false;
+        try (java.util.zip.ZipFile z = new java.util.zip.ZipFile(zip.toFile())) {
+            String prefix = null;
+            int bestDepth = 99, count = 0;
+            for (Enumeration<? extends java.util.zip.ZipEntry> en = z.entries(); en.hasMoreElements();) {
+                java.util.zip.ZipEntry e = en.nextElement();
+                if (++count > WORLD_MAX_ENTRIES) throw new IOException(I18n.t("В архіві забагато файлів"));
+                String n = e.getName().replace('\\', '/');
+                if (e.isDirectory() || n.startsWith("__MACOSX/") || !(n.equals("level.dat") || n.endsWith("/level.dat"))) continue;
+                int depth = n.split("/").length - 1;
+                if (depth <= 2 && depth < bestDepth) { bestDepth = depth; prefix = n.substring(0, n.length() - "level.dat".length()); }
+            }
+            if (prefix == null) throw new IOException(I18n.t("Це не мапа Minecraft: в архіві немає level.dat"));
+            String name = fallbackName;
+            if (!prefix.isEmpty()) {
+                String[] seg = prefix.split("/");
+                name = seg[seg.length - 1];
+            }
+            name = safeName(name);
+            if (name.startsWith(".")) name = "_" + name;
+            Path fin = child(saves, name);
+            for (int i = 2; Files.exists(fin, LinkOption.NOFOLLOW_LINKS); i++) fin = child(saves, name + " (" + i + ")");
+
+            tmp = saves.resolve(".pax-tmp-" + Long.toHexString(System.nanoTime()));
+            Files.createDirectories(tmp);
+            Path root = tmp.toAbsolutePath().normalize();
+            long total = 0;
+            byte[] buf = new byte[65536];
+            for (Enumeration<? extends java.util.zip.ZipEntry> en = z.entries(); en.hasMoreElements();) {
+                if (cancel.getAsBoolean()) throw new Engine.Cancelled();
+                java.util.zip.ZipEntry e = en.nextElement();
+                String n = e.getName().replace('\\', '/');
+                if (!n.startsWith(prefix) || n.startsWith("__MACOSX/")) continue;
+                String rel = n.substring(prefix.length());
+                if (rel.isEmpty()) continue;
+                if (rel.startsWith("/") || rel.equals("..") || rel.startsWith("../") || rel.contains("/../") || rel.endsWith("/..") || rel.matches("^[A-Za-z]:.*"))
+                    throw new IOException(I18n.t("Небезпечний шлях в архіві: ") + n);
+                Path out = root.resolve(rel).normalize();
+                if (!out.startsWith(root) || out.equals(root)) throw new IOException(I18n.t("Небезпечний шлях в архіві: ") + n);
+                if (e.isDirectory()) { Files.createDirectories(out); continue; }
+                Files.createDirectories(out.getParent());
+                try (InputStream in = z.getInputStream(e); OutputStream os = Files.newOutputStream(out)) {
+                    int r;
+                    while ((r = in.read(buf)) > 0) {
+                        total += r;
+                        if (total > WORLD_MAX_BYTES) throw new IOException(I18n.t("Архів завеликий після розпакування (понад 4 ГБ)"));
+                        os.write(buf, 0, r);
+                    }
+                }
+            }
+            Files.move(tmp, fin);
+            done = true;
+            return fin.getFileName().toString();
+        } catch (java.nio.file.InvalidPathException e) {
+            throw new IOException(I18n.t("Некоректна назва файлу в архіві"));
+        } finally {
+            if (!done && tmp != null) { try { deleteTree(tmp); } catch (IOException ignored) { } }
         }
     }
 }

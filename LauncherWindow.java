@@ -97,7 +97,15 @@ final class LauncherWindow extends JFrame {
 
     final Combo<Prof> mProf = new Combo<>();
     final Combo<ModApi.Kind> mKind = new Combo<>();
-    boolean kindChosen() { return mKind.getSelectedItem() instanceof ModApi.Kind; }
+    final Combo<ModApi.Source> mSrc = new Combo<>();
+    boolean srcAuto;
+    ModApi.Source srcNow() {
+        Object o = mSrc.getSelectedItem();
+        return o instanceof ModApi.Source ? (ModApi.Source) o : ModApi.Source.MODRINTH;
+    }
+    boolean srcChosen() { return mSrc.getSelectedItem() instanceof ModApi.Source; }
+    /** Пошук доступний, лише коли обрано і категорію, і платформу. */
+    boolean kindChosen() { return mKind.getSelectedItem() instanceof ModApi.Kind && srcChosen(); }
     final Btn mDirB = new Btn(I18n.t("Папка модів"), Btn.Kind.SECONDARY);
     final Btn mRmB = new Btn(I18n.t("Видалити мод"), Btn.Kind.SECONDARY);
     final JLabel mInstTitle = label(I18n.t("Встановлені моди"), 15, true, Theme.TEXT);
@@ -105,7 +113,7 @@ final class LauncherWindow extends JFrame {
     final Field mQuery = new Field("");
     final JLabel mInfo = label(" ", 13, false, Theme.MUTED);
     final JPanel mInfoWrap = new JPanel();
-    Btn mImpB;
+    Btn mImpB, mImpPackB;
     JPanel mTop;
     final JLabel dIcon = new JLabel();
     JPanel dIconWrap;
@@ -249,20 +257,28 @@ final class LauncherWindow extends JFrame {
     volatile ModApi.Kind kindNow = ModApi.Kind.MOD;
 
     void prefetchMods(String mcv, String loader) {
-        if (mcv == null || loader == null) return;
+        if (mcv == null || loader == null || !srcChosen()) return;
+        final ModApi.Source src = srcNow();
         for (ModApi.Kind k : ModApi.Kind.values()) {
             if (k.isMod() && loader.equals("Vanilla")) continue;
+            if (src == ModApi.Source.MODRINTH && !k.onModrinth()) continue;
             Thread t = new Thread(() -> {
-                try { warmHits(api.search(k, "", mcv, loader, 0), 8000); } catch (Throwable ignored) { }
+                try { warmHits(api.search(src, k, "", mcv, loader, 0), 8000); } catch (Throwable ignored) { }
             }, "mods-prefetch-" + k.type);
             t.setDaemon(true);
             t.start();
         }
     }
 
-    void warmHits(List<ModApi.Hit> hs, long maxMs) { warmHits(hs, maxMs, false); }
+    void warmHits(List<ModApi.Hit> hs, long maxMs) { warmHits(hs, maxMs, false, () -> false); }
 
-    void warmHits(List<ModApi.Hit> hs, long maxMs, boolean more) {
+    /** Готує іконку одразу (у фоні), щоб потік інтерфейсу не масштабував зображення під час малювання списку. */
+    void prebuildIcon(String url, BufferedImage im) {
+        if (url == null || im == null || im == NO_ICON) return;
+        try { iconObjs.computeIfAbsent(url + "@40", k -> new ImgIcon(im, 40)); } catch (Throwable ignored) { }
+    }
+
+    void warmHits(List<ModApi.Hit> hs, long maxMs, boolean more, java.util.function.BooleanSupplier stale) {
         if (hs == null || hs.isEmpty()) return;
         long end = System.currentTimeMillis() + maxMs;
         List<Future<?>> fs = new ArrayList<>();
@@ -271,14 +287,19 @@ final class LauncherWindow extends JFrame {
             ModApi.Hit h = hs.get(i);
             final boolean head = i == 0 && !more;
             String u = h.iconUrl();
-            if (u != null && !u.isEmpty() && !iconRaw.containsKey(u))
+            if (u != null && !u.isEmpty())
                 fs.add(iconPool.submit(() -> {
-                    if (iconRaw.containsKey(u)) return;
-                    BufferedImage im = fetchProjectIcon(u);
-                    if (im != null) iconRaw.put(u, im);
+                    if (stale.getAsBoolean()) return;
+                    BufferedImage im = iconRaw.get(u);
+                    if (im == null) {
+                        im = fetchProjectIcon(u);
+                        if (im != null) iconRaw.put(u, im);
+                    }
+                    prebuildIcon(u, im);
                 }));
-            if (api.needsTranslation(h.desc())) fs.add(iconPool.submit(() -> { api.translate(h.desc()); }));
+            if (api.needsTranslation(h.desc())) fs.add(iconPool.submit(() -> { if (!stale.getAsBoolean()) api.translate(h.desc()); }));
             if (head) fs.add(iconPool.submit(() -> {
+                if (stale.getAsBoolean()) return;
                 try {
                     ModApi.Detail pd = api.project(h.id());
                     if (pd != null) tr(ModApi.excerpt(pd.body(), 1200));
@@ -286,6 +307,7 @@ final class LauncherWindow extends JFrame {
             }));
         }
         for (Future<?> f : fs) {
+            if (stale.getAsBoolean()) break;
             long left = end - System.currentTimeMillis();
             if (left <= 0) break;
             try { f.get(left, TimeUnit.MILLISECONDS); } catch (Throwable ignored) { }
@@ -294,6 +316,10 @@ final class LauncherWindow extends JFrame {
 
     LauncherWindow() {
         Art.preload();
+        ModApi.translateOn = cfg.getb("translateDesc", true);
+        Thread trWarm = new Thread(api::preloadTranslations, "tr-preload");
+        trWarm.setDaemon(true);
+        trWarm.start();
         setTitle("PaxLauncher");
         setIconImage(Theme.icon(64));
         setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
@@ -2110,6 +2136,8 @@ final class LauncherWindow extends JFrame {
         ModApi.Kind k = curKind();
         setModInfo(k.isMod() && p.loader().equals("Vanilla")
                 ? I18n.t("Чиста збірка не підтримує моди. Створи збірку на основі Fabric / Quilt / Forge / NeoForge (набори ресурсів працюють і в чистій).")
+                : k == ModApi.Kind.WORLD
+                ? I18n.t("Мапи беруться з CurseForge (на Modrinth їх немає) й розпаковуються в папку saves цієї збірки. Наявні світи не перезаписуються.")
                 : k == ModApi.Kind.SHADER
                 ? I18n.t("Шейдерам потрібен мод Iris (Fabric / Quilt / NeoForge) або OptiFine — встанови його в цю збірку на вкладці «Моди».")
                 : null);
@@ -2319,10 +2347,16 @@ final class LauncherWindow extends JFrame {
         mKind.addItem(ModApi.Kind.MOD);
         mKind.addItem(ModApi.Kind.PACK);
         mKind.addItem(ModApi.Kind.SHADER);
+        mKind.addItem(ModApi.Kind.WORLD);
         mKind.placeholder = I18n.t("Оберіть категорію пошуку");
         mKind.setSelectedItem(null);
         mKind.setPreferredSize(new Dimension(260, 44));
         mProf.setPreferredSize(new Dimension(260, 44));
+        mSrc.addItem(ModApi.Source.MODRINTH);
+        mSrc.addItem(ModApi.Source.CURSEFORGE);
+        mSrc.placeholder = I18n.t("Оберіть платформу");
+        mSrc.setSelectedItem(null);
+        mSrc.setPreferredSize(new Dimension(190, 44));
 
         Btn newB = small(new Btn(I18n.t("Нова збірка"), Btn.Kind.SECONDARY));
         Btn delB = small(new Btn(I18n.t("Видалити збірку"), Btn.Kind.SECONDARY));
@@ -2341,10 +2375,10 @@ final class LauncherWindow extends JFrame {
         JPanel r1b = new JPanel();
         r1b.setOpaque(false);
         r1b.setLayout(new BoxLayout(r1b, BoxLayout.X_AXIS));
-        Btn impB = small(new Btn(I18n.t("Перенесення модів"), Btn.Kind.SECONDARY));
-        impB.addActionListener(e -> importMods());
+        Btn impB = small(new Btn(I18n.t("Імпортувати файли"), Btn.Kind.SECONDARY));
+        impB.addActionListener(e -> importChooser());
         mImpB = impB;
-        JComponent[] r1c = {newB, delB, dirB, impB};
+        JComponent[] r1c = {newB, delB, impB};
         for (int ci = 0; ci < r1c.length; ci++) {
             if (ci > 0) r1b.add(Box.createHorizontalStrut(8));
             r1c[ci].setAlignmentY(Component.CENTER_ALIGNMENT);
@@ -2356,7 +2390,13 @@ final class LauncherWindow extends JFrame {
 
         JPanel row2 = new JPanel(new BorderLayout(10, 0));
         row2.setOpaque(false);
-        row2.add(mKind, BorderLayout.WEST);
+        JPanel kindBox = new JPanel();
+        kindBox.setOpaque(false);
+        kindBox.setLayout(new BoxLayout(kindBox, BoxLayout.X_AXIS));
+        kindBox.add(mKind);
+        kindBox.add(Box.createHorizontalStrut(8));
+        kindBox.add(mSrc);
+        row2.add(kindBox, BorderLayout.WEST);
         row2.add(mQuery, BorderLayout.CENTER);
         JPanel r2b = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
         r2b.setOpaque(false);
@@ -2383,21 +2423,17 @@ final class LauncherWindow extends JFrame {
         mList.setBackground(Theme.CARD2);
         mList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         mList.setFixedCellHeight(58);
-        mList.setCellRenderer(new DefaultListCellRenderer() {
-            @Override public Component getListCellRendererComponent(JList<?> l, Object v, int i, boolean sel, boolean foc) {
-                super.getListCellRendererComponent(l, v, i, sel, false);
-                ModApi.Hit h = (ModApi.Hit) v;
-                String full = api.cached(h.desc());
-                String d = full.length() > 50 ? full.substring(0, 50) + "…" : full;
-                setText("<html><b>" + esc(h.title()) + "</b>  <font color='" + Theme.hex(Theme.SUB) + "'>" + fmt(h.downloads()) + I18n.t(" завант.")
-                        + "</font><br><font color='" + Theme.hex(Theme.SUB) + "'>" + esc(d) + "</font></html>");
-                setIcon(modIcon(h.iconUrl(), 40, mList));
-                setIconTextGap(12);
-                setBackground(sel ? Theme.SEL : Theme.CARD2);
-                setForeground(Theme.TEXT);
-                setFont(Theme.font(Font.PLAIN, 13));
-                setBorder(new EmptyBorder(6, 12, 6, 12));
-                return this;
+        mList.setCellRenderer(new ListCellRenderer<ModApi.Hit>() {
+            final RowCell cell = new RowCell(58);
+            @Override public Component getListCellRendererComponent(JList<? extends ModApi.Hit> l, ModApi.Hit h, int i, boolean sel, boolean foc) {
+                cell.sel = sel;
+                cell.dim = false;
+                cell.title = h.title();
+                cell.meta = fmt(h.downloads()) + I18n.t(" завант.");
+                cell.sub = api.cached(h.desc());
+                final String u = h.iconUrl();
+                cell.icon = () -> modIcon(u, 40, mList);
+                return cell;
             }
         });
         JScrollPane lsp = new JScrollPane(mList); Smooth.install(lsp);
@@ -2486,22 +2522,19 @@ final class LauncherWindow extends JFrame {
         iList.setBackground(Theme.CARD2);
         iList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         iList.setFixedCellHeight(54);
-        iList.setCellRenderer(new DefaultListCellRenderer() {
-            @Override public Component getListCellRendererComponent(JList<?> l, Object v, int i, boolean sel, boolean foc) {
-                super.getListCellRendererComponent(l, v, i, sel, false);
-                String n = (String) v;
+        iList.setCellRenderer(new ListCellRenderer<String>() {
+            final RowCell cell = new RowCell(54);
+            @Override public Component getListCellRendererComponent(JList<? extends String> l, String n, int i, boolean sel, boolean foc) {
                 boolean off = n.endsWith(".disabled");
                 String base = off ? n.substring(0, n.length() - 9) : n;
-                String shown = base.replaceFirst("(?i)\\.(jar|zip)$", "");
-                setText("<html><b>" + esc(shown) + "</b>" + (off ? "  <font color='" + Theme.hex(Theme.SUB) + "'>" + esc(I18n.t("   (вимкнено)").trim()) + "</font>" : "")
-                        + "<br><font color='" + Theme.hex(Theme.SUB) + "'>" + esc(base) + "</font></html>");
-                setIcon(modIcon(fileIcon.get(iconDirKey + "|" + base), 40, iList));
-                setIconTextGap(12);
-                setBackground(sel ? Theme.SEL : Theme.CARD2);
-                setForeground(off && !sel ? Theme.MUTED : Theme.TEXT);
-                setFont(Theme.font(Font.PLAIN, 13));
-                setBorder(new EmptyBorder(6, 12, 6, 12));
-                return this;
+                cell.sel = sel;
+                cell.dim = off;
+                cell.title = base.replaceFirst("(?i)\\.(jar|zip)$", "");
+                cell.meta = off ? I18n.t("   (вимкнено)").trim() : "";
+                cell.sub = base;
+                final String tok = fileIcon.get(iconDirKey + "|" + base);
+                cell.icon = () -> modIcon(tok, 40, iList);
+                return cell;
             }
         });
         JScrollPane isp = new JScrollPane(iList); Smooth.install(isp);
@@ -2516,11 +2549,12 @@ final class LauncherWindow extends JFrame {
         Btn rmB = small(mRmB);
         small(iPage);
         iPage.setEnabled(false);
-        JPanel ib = new JPanel(new GridLayout(1, 3, 10, 0));
+        JPanel ib = new JPanel(new GridLayout(1, 4, 10, 0));
         ib.setOpaque(false);
         ib.add(togB);
         ib.add(rmB);
         ib.add(iPage);
+        ib.add(mDirB);
         Inset iFoot = new Inset(new BorderLayout());
         iFoot.add(ib, BorderLayout.CENTER);
         JPanel iBody = new JPanel(new BorderLayout(0, 12));
@@ -2544,7 +2578,10 @@ final class LauncherWindow extends JFrame {
             if (n == null) return;
             String base = n.endsWith(".disabled") ? n.substring(0, n.length() - 9) : n;
             String pid = iProj.get(iconDirKey + "|" + base);
-            if (pid != null) browse("https://modrinth.com/" + curKind().type + "/" + pid);
+            if (pid != null) {
+                if (CurseForge.isCf(pid)) browse("https://www.curseforge.com/projects/" + pid.substring(3).replaceAll("\\D", ""));
+                else browse("https://modrinth.com/" + curKind().type + "/" + pid);
+            }
         });
 
         mCenter.setOpaque(false);
@@ -2608,9 +2645,33 @@ final class LauncherWindow extends JFrame {
         mPage.setEnabled(false);
 
         mProf.addActionListener(e -> { if (!mFilling) onProfileChanged(); });
-        mPulse.addActionListener(e -> { if (mLoading) { mList.repaint(); mSpin.repaint(); } else mPulse.stop(); });
+        mPulse.addActionListener(e -> { if (mLoading) { if (mSpin.isShowing()) mSpin.repaint(); } else mPulse.stop(); });
+        mSrc.addActionListener(e -> {
+            if (srcAuto || !srcChosen()) return;
+            ModApi.Source sn = srcNow();
+            if (sn == ModApi.Source.MODRINTH && mKind.getSelectedItem() instanceof ModApi.Kind && curKind().isWorld()) {
+                msg(I18n.t("Мап на Modrinth немає — вони є лише на CurseForge."));
+                srcAuto = true;
+                mSrc.setSelectedItem(ModApi.Source.CURSEFORGE);
+                srcAuto = false;
+                return;
+            }
+            cfg.set("modSource", sn.name());
+            cfg.save();
+            kindNow = curKind();
+            applyKindTexts();
+            if (modsInit && !mFilling) { showInstalledView(false); onProfileChanged(); }
+        });
         mKind.addActionListener(e -> {
             kindNow = curKind();
+            if (mKind.getSelectedItem() instanceof ModApi.Kind && curKind().isWorld()
+                    && (!srcChosen() || srcNow() == ModApi.Source.MODRINTH)) {
+                srcAuto = true;
+                mSrc.setSelectedItem(ModApi.Source.CURSEFORGE);
+                srcAuto = false;
+                cfg.set("modSource", ModApi.Source.CURSEFORGE.name());
+                cfg.save();
+            }
             applyKindTexts();
             if (modsInit && !mFilling) { showInstalledView(false); onProfileChanged(); }
         });
@@ -2677,12 +2738,16 @@ final class LauncherWindow extends JFrame {
         mVerLabel.setText(k.versionLabel);
         mToggleView.setText(mInstalledView ? k.searchTitle : k.installedTitle);
         iPage.setText(k.pageBtn);
-        if (mImpB != null && mImpB.isVisible() != k.isMod()) {
-            mImpB.setVisible(k.isMod());
-            if (mImpB.getParent() != null) { mImpB.getParent().revalidate(); mImpB.getParent().repaint(); }
-        }
         for (JComponent c : new JComponent[]{mDirB, mRmB, mPage, mToggleView, iPage}) {
             if (c.getParent() != null) { c.getParent().revalidate(); c.getParent().repaint(); }
+        }
+    }
+
+    static String importTitle(ModApi.Kind k) {
+        switch (k) {
+            case PACK: return I18n.t("Перенесення наборів ресурсів");
+            case SHADER: return I18n.t("Перенесення шейдерів");
+            default: return I18n.t("Перенесення модів");
         }
     }
 
@@ -2695,29 +2760,58 @@ final class LauncherWindow extends JFrame {
         dDesc.setCaretPosition(0);
     }
 
+    final javax.swing.Timer mRepaintT = new javax.swing.Timer(150, null);
+    final javax.swing.Timer iRepaintT = new javax.swing.Timer(150, null);
+    {
+        mRepaintT.setRepeats(false);
+        mRepaintT.addActionListener(e -> mList.repaint());
+        iRepaintT.setRepeats(false);
+        iRepaintT.addActionListener(e -> iList.repaint());
+    }
+
+    /** Не більше одного перемальовування списку за ~150 мс, навіть якщо в фоні щойно прийшла сотня описів/іконок. */
+    void repaintListSoon() { if (!mRepaintT.isRunning()) mRepaintT.start(); }
+
+    void repaintInstalledSoon() {
+        SwingUtilities.invokeLater(() -> { if (!iRepaintT.isRunning()) iRepaintT.start(); });
+    }
+
+    final ExecutorService trPool = Executors.newFixedThreadPool(3, r -> {
+        Thread t = new Thread(r, "mod-translate");
+        t.setDaemon(true);
+        t.setPriority(Thread.NORM_PRIORITY - 1);
+        return t;
+    });
+    final Set<String> trQueued = ConcurrentHashMap.newKeySet();
+
     void translateHits() { translateHits(0); }
 
     void translateHits(int attempt) {
         List<ModApi.Hit> hs = Collections.list(mModel.elements());
         int my = mSeq.get();
-        ExecutorService ex = Executors.newFixedThreadPool(3, r -> { Thread t = new Thread(r, "mod-translate"); t.setDaemon(true); return t; });
         boolean left = false;
         for (ModApi.Hit h : hs) {
-            if (!api.needsTranslation(h.desc())) continue;
+            String d = h.desc();
+            if (!api.needsTranslation(d)) continue;
             left = true;
-            ex.submit(() -> {
-                if (my != mSeq.get()) return;
-                api.translate(h.desc());
+            if (!trQueued.add(d)) continue;
+            trPool.execute(() -> {
+                try {
+                    if (my != mSeq.get()) return;
+                    api.translate(d);
+                } finally {
+                    trQueued.remove(d);
+                }
                 SwingUtilities.invokeLater(() -> {
                     if (my != mSeq.get()) return;
-                    mList.repaint();
+                    repaintListSoon();
                     if (h == mList.getSelectedValue()) setDesc(h);
                 });
             });
         }
-        ex.shutdown();
-        if (left && attempt < 4) {
-            javax.swing.Timer rt = new javax.swing.Timer(6000, e -> { if (my == mSeq.get()) translateHits(attempt + 1); });
+        if (left && attempt < 25) {
+            int delay = Math.min(12000, 3000 + attempt * 1000);
+            javax.swing.Timer rt = new javax.swing.Timer(delay, e -> { if (my == mSeq.get()) translateHits(attempt + 1); });
             rt.setRepeats(false);
             rt.start();
         }
@@ -2744,14 +2838,18 @@ final class LauncherWindow extends JFrame {
         }
         setFootVisible(true);
         dTitle.setText(h.title());
-        dMeta.setText(I18n.t("від ") + h.author() + "  ·  Modrinth");
+        dMeta.setText(I18n.t("від ") + h.author() + "  ·  " + h.source().label);
         fillChips(dChips, hitChips(h, null));
         setLabelIcon(dIcon, h.iconUrl(), 72);
         setDesc(h);
         if (api.needsTranslation(h.desc())) {
             new Thread(() -> {
-                api.translate(h.desc());
-                SwingUtilities.invokeLater(() -> { if (h == mList.getSelectedValue()) setDesc(h); });
+                for (int i = 0; i < 6 && my == dSeq.get() && api.needsTranslation(h.desc()); i++) {
+                    api.translate(h.desc());
+                    if (!api.needsTranslation(h.desc())) break;
+                    try { Thread.sleep(2500L * (i + 1)); } catch (InterruptedException e) { return; }
+                }
+                SwingUtilities.invokeLater(() -> { if (my == dSeq.get() && h == mList.getSelectedValue()) setDesc(h); repaintListSoon(); });
             }, "mod-translate-one").start();
         }
         mPage.setEnabled(true);
@@ -2759,14 +2857,26 @@ final class LauncherWindow extends JFrame {
             ModApi.Detail pd = null;
             try { pd = api.project(h.id()); } catch (Exception ignored) { }
             if (pd == null || my != dSeq.get()) return;
-            String body = tr(ModApi.excerpt(pd.body(), 1200));
-            ModApi.Detail fpd = pd;
+            final String raw = ModApi.excerpt(pd.body(), 1200);
+            final ModApi.Detail fpd = pd;
             SwingUtilities.invokeLater(() -> {
                 if (my != dSeq.get()) return;
-                dBody = body;
+                dBody = api.cached(raw);
                 fillChips(dChips, hitChips(h, fpd));
                 setDesc(h);
             });
+            for (int i = 0; i < 6 && my == dSeq.get() && api.needsTranslation(raw); i++) {
+                final String t = api.translate(raw);
+                if (!api.needsTranslation(raw)) {
+                    SwingUtilities.invokeLater(() -> {
+                        if (my != dSeq.get()) return;
+                        dBody = t;
+                        setDesc(h);
+                    });
+                    break;
+                }
+                try { Thread.sleep(2500L * (i + 1)); } catch (InterruptedException e) { return; }
+            }
         }, "mod-detail").start();
     }
 
@@ -2792,7 +2902,7 @@ final class LauncherWindow extends JFrame {
     void onInstalledSelected() {
         String n = iList.getSelectedValue();
         boolean has = n != null && curProf() != null;
-        togB.setEnabled(has);
+        togB.setEnabled(has && !curKind().isWorld());
         mRmB.setEnabled(has);
         if (!has) { iPage.setEnabled(false); return; }
         boolean off = n.endsWith(".disabled");
@@ -2805,6 +2915,7 @@ final class LauncherWindow extends JFrame {
         Prof p = curProf();
         if (p == null) { if (!quiet) msg(I18n.t("Спочатку створи збірку («Нова збірка»).")); return; }
         ModApi.Kind k = curKind();
+        final ModApi.Source src = srcNow();
         if (k.isMod() && p.loader().equals("Vanilla")) {
             if (!quiet) msg(I18n.t("Чиста збірка не підтримує моди.\nСтвори збірку на основі Fabric / Quilt / Forge / NeoForge."));
             return;
@@ -2822,12 +2933,12 @@ final class LauncherWindow extends JFrame {
             showDetails(null);
             updateEmptyState();
         }
-        mStatus.setText(I18n.t("Пошук: ") + k.title.toLowerCase(Locale.ROOT) + I18n.t(" на Modrinth…"));
+        mStatus.setText(I18n.t("Пошук: ") + k.title.toLowerCase(Locale.ROOT) + I18n.t(" на ") + src.label + "…");
         new Thread(() -> {
             List<ModApi.Hit> res = null;
             String err = null;
-            try { res = api.search(k, q, p.mc(), p.loader(), off); } catch (Exception ex) { err = ex.getMessage(); }
-            if (res != null && my == mSeq.get()) warmHits(res, more ? 1500 : 900, more);
+            try { res = api.search(src, k, q, p.mc(), p.loader(), off); } catch (Exception ex) { err = ex.getMessage(); }
+            if (res != null && my == mSeq.get()) warmHits(res, more ? 1500 : 900, more, () -> my != mSeq.get());
             List<ModApi.Hit> rr = res;
             String er = err;
             SwingUtilities.invokeLater(() -> {
@@ -2835,14 +2946,14 @@ final class LauncherWindow extends JFrame {
                 mLoading = false;
                 mSearch.setEnabled(true);
                 if (!more) mModel.clear();
-                if (rr != null) for (ModApi.Hit h : rr) mModel.addElement(h);
+                if (rr != null && !rr.isEmpty()) mModel.addAll(rr);
                 updateEmptyState();
                 if (!more && !mModel.isEmpty() && mList.getSelectedIndex() < 0) mList.setSelectedIndex(0);
                 if (!more && mModel.isEmpty()) showDetails(null);
                 mMore.setEnabled(rr != null && rr.size() >= ModApi.PAGE);
                 mStatus.setText(er != null ? I18n.t("Помилка пошуку: ") + er
                         : mModel.isEmpty() ? I18n.t("Нічого не знайдено для ") + target(k, p)
-                        : I18n.t("Знайдено: ") + mModel.size() + " • " + k.title + " • " + target(k, p));
+                        : I18n.t("Знайдено: ") + mModel.size() + " • " + k.title + " • " + src.label + " • " + target(k, p));
                 mBar.set(0);
                 if (rr != null) translateHits();
             });
@@ -2932,26 +3043,50 @@ final class LauncherWindow extends JFrame {
         }, "mod-install").start();
     }
 
-    void importMods() {
+    /** Одна кнопка імпорту: у вікні обирається, що саме переносимо — моди чи набори ресурсів. */
+    void importChooser() {
+        if (curProf() == null) { msg(I18n.t("Спочатку створи збірку («Нова збірка»).")); return; }
+        if (mBusy) return;
+        Combo<ModApi.Kind> what = new Combo<>();
+        what.addItem(ModApi.Kind.MOD);
+        what.addItem(ModApi.Kind.PACK);
+        what.setPreferredSize(new Dimension(Theme.px(320), Theme.px(44)));
+        JPanel box = new JPanel();
+        box.setOpaque(false);
+        box.setLayout(new BoxLayout(box, BoxLayout.Y_AXIS));
+        JLabel lb = label(I18n.t("Що імпортувати?"), 13, true, Theme.MUTED);
+        lb.setAlignmentX(Component.LEFT_ALIGNMENT);
+        what.setAlignmentX(Component.LEFT_ALIGNMENT);
+        box.add(lb);
+        box.add(Box.createVerticalStrut(8));
+        box.add(what);
+        if (!Dlg.show(this, I18n.t("Імпортувати файли"), box, I18n.t("Далі"), I18n.t("Скасувати"))) return;
+        importMods((ModApi.Kind) what.getSelectedItem());
+    }
+
+    void importMods(ModApi.Kind ik) {
         Prof p = curProf();
         if (p == null) { msg(I18n.t("Спочатку створи збірку («Нова збірка»).")); return; }
         if (mBusy) return;
-        File[] picked = FilePick.show(this, I18n.t("Обери папку збірки (або папку mods) чи окремі .jar"),
+        final String ext = ik.isMod() ? ".jar" : ".zip";
+        File[] picked = FilePick.show(this, ik.isMod()
+                        ? I18n.t("Обери папку збірки (або папку mods) чи окремі .jar")
+                        : I18n.t("Обери папку збірки (або папку ") + ik.folder + I18n.t(") чи окремі .zip"),
                 JFileChooser.FILES_AND_DIRECTORIES, true, null);
         if (picked == null) return;
         List<Path> jars = new ArrayList<>();
         for (File sel : picked) {
             Path sp = sel.toPath();
             if (Files.isDirectory(sp)) {
-                Path md = Files.isDirectory(sp.resolve("mods")) ? sp.resolve("mods") : sp;
+                Path md = Files.isDirectory(sp.resolve(ik.folder)) ? sp.resolve(ik.folder) : sp;
                 try (var st = Files.list(md)) {
-                    st.filter(x -> Files.isRegularFile(x) && x.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar"))
+                    st.filter(x -> Files.isRegularFile(x) && x.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(ext))
                       .sorted().forEach(jars::add);
                 } catch (IOException ex) { log(I18n.t("Помилка: ") + ex); }
-            } else if (sp.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar")) jars.add(sp);
+            } else if (sp.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(ext)) jars.add(sp);
         }
-        if (jars.isEmpty()) { msg(I18n.t("Файлів .jar не знайдено.")); return; }
-        Path dir = instDir(p.name()).resolve(ModApi.Kind.MOD.folder);
+        if (jars.isEmpty()) { msg(I18n.t("Файлів ") + ext + I18n.t(" не знайдено.")); return; }
+        Path dir = instDir(p.name()).resolve(ik.folder);
         mBusy = true;
         mCancelled = false;
         mInstall.setEnabled(false);
@@ -2966,7 +3101,7 @@ final class LauncherWindow extends JFrame {
                 for (int i = 0; i < jars.size(); i++) {
                     double frac = (double) i / jars.size();
                     SwingUtilities.invokeLater(() -> mBar.set(frac));
-                    rows.add(api.importJar(jars.get(i), p.mc(), p.loader(), dir, seen,
+                    rows.add(api.importFile(ik, jars.get(i), p.mc(), p.loader(), dir, seen,
                             t -> SwingUtilities.invokeLater(() -> mStatus.setText(t)), () -> mCancelled));
                 }
             } catch (Engine.Cancelled ex) {
@@ -2982,12 +3117,12 @@ final class LauncherWindow extends JFrame {
                 if (wasCancelled) mBar.set(0); else mBar.done();
                 mStatus.setText(wasCancelled ? I18n.t("Завантаження скасовано") : I18n.t("Готово"));
                 refreshInstalled();
-                showImportReport(p, rows, jars.size());
+                showImportReport(p, rows, jars.size(), ik);
             });
         }, "mod-import").start();
     }
 
-    void showImportReport(Prof p, List<ModApi.ImportRow> rows, int total) {
+    void showImportReport(Prof p, List<ModApi.ImportRow> rows, int total, ModApi.Kind ik) {
         StringBuilder bad = new StringBuilder();
         int ok = 0;
         for (ModApi.ImportRow r : rows) {
@@ -2997,7 +3132,7 @@ final class LauncherWindow extends JFrame {
         }
         int notDone = total - rows.size();
         if (notDone > 0) bad.append("• ").append(I18n.t("не оброблено через скасування: ")).append(notDone).append("\n");
-        String head = I18n.t("Встановлено: ") + ok + " / " + total + "  (" + p.loader() + " " + p.mc() + ")";
+        String head = I18n.t("Встановлено: ") + ok + " / " + total + "  (" + target(ik, p) + ")";
         if (bad.length() == 0) { msg(head); return; }
         JTextArea ta = new JTextArea(head + "\n\n" + I18n.t("Не вдалося встановити:") + "\n" + bad);
         ta.setEditable(false);
@@ -3008,7 +3143,7 @@ final class LauncherWindow extends JFrame {
         ta.setFont(Theme.font(Font.PLAIN, 13));
         JScrollPane sp = new JScrollPane(ta);
         sp.setPreferredSize(new Dimension(560, 300));
-        Dlg.show(this, I18n.t("Перенесення модів"), sp, I18n.t("Закрити"), null);
+        Dlg.show(this, importTitle(ik), sp, I18n.t("Закрити"), null);
     }
 
     final AtomicInteger iSeq = new AtomicInteger();
@@ -3023,11 +3158,12 @@ final class LauncherWindow extends JFrame {
         if (!Files.isDirectory(d)) return;
         List<String> names = new ArrayList<>();
         try (var st = Files.list(d)) {
-            st.filter(x -> Files.isRegularFile(x)).map(x -> x.getFileName().toString())
+            st.filter(x -> k.isWorld() ? Files.isDirectory(x) : Files.isRegularFile(x)).map(x -> x.getFileName().toString())
                     .filter(k::matches)
                     .sorted(String.CASE_INSENSITIVE_ORDER)
-                    .forEach(n -> { iModel.addElement(n); names.add(n); });
+                    .forEach(names::add);
         } catch (IOException ignored) { }
+        if (!names.isEmpty()) iModel.addAll(names);
         if (!iModel.isEmpty()) iList.setSelectedIndex(0); else onInstalledSelected();
         loadInstalledIcons(d, k, names);
     }
@@ -3073,15 +3209,15 @@ final class LauncherWindow extends JFrame {
                     }
                     if (tok == null) {
                         Path f = d.resolve(b);
-                        if (!Files.isRegularFile(f)) f = d.resolve(b + ".disabled");
+                        if (!Files.exists(f)) f = d.resolve(b + ".disabled");
                         BufferedImage em = ModApi.embeddedIcon(f, k);
                         if (em != null) {
                             tok = "file:" + key + "|" + b;
                             iconRaw.put(tok, roundIcon(em, 64));
                         }
                     }
-                    if (tok != null) fileIcon.put(key + "|" + b, tok);
-                    SwingUtilities.invokeLater(iList::repaint);
+                    if (tok != null) { prebuildIcon(tok, iconRaw.get(tok)); fileIcon.put(key + "|" + b, tok); }
+                    repaintInstalledSoon();
                 });
             }
             ex.shutdown();
@@ -3108,9 +3244,12 @@ final class LauncherWindow extends JFrame {
         String n = iList.getSelectedValue();
         if (p == null || n == null) return;
         Path d = instDir(p.name()).resolve(curKind().folder);
-        if (!Dlg.show(this, curKind().removeBtn, Dlg.text(I18n.t("Видалити ") + n + "?"), I18n.t("Видалити"), I18n.t("Скасувати"))) return;
+        if (!Dlg.show(this, curKind().removeBtn, Dlg.text(curKind().isWorld()
+                ? I18n.t("Видалити мапу ") + n + I18n.t("? Усі збереження в ній буде втрачено назавжди.")
+                : I18n.t("Видалити ") + n + "?"), I18n.t("Видалити"), I18n.t("Скасувати"))) return;
         try {
-            Files.deleteIfExists(d.resolve(n));
+            Path target = ModApi.child(d, n);
+            if (curKind().isWorld()) ModApi.deleteTree(target); else Files.deleteIfExists(target);
             ModApi.forget(d, n);
         } catch (IOException e) { msg(I18n.t("Не вдалося видалити: ") + e.getMessage()); }
         refreshInstalled();
@@ -3191,6 +3330,7 @@ final class LauncherWindow extends JFrame {
                 res = NO_ICON;
             }
             iconRaw.put(url, res);
+            prebuildIcon(url, res);
             iconBusy.remove(url);
             SwingUtilities.invokeLater(target::repaint);
         });
