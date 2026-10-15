@@ -464,6 +464,14 @@ final class Engine {
         return merge(loadVersion(parent), v);
     }
 
+    private String libKey(Map<String, Object> lib) {
+        String name = s(lib.get("name"));
+        if (name == null) return null;
+        String[] pr = name.split(":");
+        if (pr.length < 2) return null;
+        return pr[0] + ":" + pr[1] + (pr.length > 3 ? ":" + pr[3] : "");
+    }
+
     private Map<String, Object> merge(Map<String, Object> p, Map<String, Object> c) {
         Map<String, Object> r = new LinkedHashMap<>(p);
         for (var e : c.entrySet()) {
@@ -471,20 +479,23 @@ final class Engine {
             if (k.equals("arguments") || k.equals("libraries")) continue;
             r.put(k, e.getValue());
         }
-        List<Object> all = new ArrayList<>(l(c.get("libraries")));
-        all.addAll(l(p.get("libraries")));
+        // Бібліотеки батьківської версії (Vanilla) лишаємо як є — саме з таким списком Vanilla запускається.
+        // Прибираємо лише ті, що Fabric/Forge перевизначає своїми (той самий group:artifact[:classifier]).
+        Set<String> childKeys = new HashSet<>();
+        List<Object> all = new ArrayList<>();
+        for (Object o : l(c.get("libraries"))) {
+            String k = libKey(m(o));
+            if (k != null && !childKeys.add(k)) continue;
+            all.add(o);
+        }
+        for (Object o : l(p.get("libraries"))) {
+            String k = libKey(m(o));
+            if (k != null && childKeys.contains(k)) continue;
+            all.add(o);
+        }
         Map<String, Object> uniq = new LinkedHashMap<>();
         int n = 0;
-        for (Object o : all) {
-            String name = s(m(o).get("name"));
-            String key;
-            if (name == null) key = "#" + (n++);
-            else {
-                String[] pr = name.split(":");
-                key = pr[0] + ":" + pr[1] + (pr.length > 3 ? ":" + pr[3] : "");
-            }
-            uniq.putIfAbsent(key, o);
-        }
+        for (Object o : all) uniq.put("#" + (n++), o);
         r.put("libraries", new ArrayList<>(uniq.values()));
         Map<String, Object> pa = m(p.get("arguments")), ca = m(c.get("arguments"));
         if (pa != null || ca != null) {
@@ -869,6 +880,9 @@ final class Engine {
                 String url = s(art.get("url"));
                 if (url != null && !url.isEmpty()) tasks.add(new Task(url, f, s(art.get("sha1"))));
                 cp.add(f);
+                String lname = s(lib.get("name"));
+                String[] lp = lname == null ? new String[0] : lname.split(":");
+                if (lp.length > 3 && lp[3].startsWith("natives-") && !nativeJars.contains(f)) nativeJars.add(f);
             } else if (lib.get("downloads") == null && s(lib.get("name")) != null) {
                 String path = mavenPath(s(lib.get("name")));
                 String base = s(lib.get("url"));
