@@ -1645,8 +1645,10 @@ final class LauncherWindow extends JFrame {
             }
             SwingUtilities.invokeLater(this::refreshHostUi);
         }
-        if (l != null && hostLanPort > 0 && ln != null && ln.contains(" joined the game")) {
-            // сигнал агенту в грі: хост зайшов у світ — можна відкривати його для мережі
+        if (l != null && hostLanPort > 0 && ln != null && (ln.contains(" joined the game")
+                || (ln.contains(" logged in with entity id ") && ln.contains("[local:")))) {
+            // сигнал агенту в грі: хост зайшов у світ — можна відкривати його для мережі.
+            // Рядок «logged in with entity id» не залежить від мови гри (чат може бути українською), на відміну від «joined the game».
             try {
                 Path f = flagPath();
                 Files.createDirectories(f.getParent());

@@ -11,7 +11,7 @@ import javax.tools.ToolProvider;
  * і з обфускованими, і з модовими збірками. Агент збирається один раз із вбудованого коду (потрібна Java з компілятором).
  */
 final class LanAgent {
-    private static final String VER = "7";
+    private static final String VER = "8";
 
     private LanAgent() { }
 
@@ -139,7 +139,7 @@ public final class PaxLanAgent {
                 // агент «озбройюється», коли гравець уже у світі: або лаунчер побачив «joined the game», або свіжий session.lock
                 long fm = mtime(flag);
                 long lm = mtime(lock);
-                boolean armed = fm >= start || (lm >= start && now - lm > 12000L);
+                boolean armed = fm >= start || (lm >= start && now - lm > 60000L);
                 if (!armed) continue;
                 if (pub == null) {
                     if (now - lastLocate < 8000L) continue;
