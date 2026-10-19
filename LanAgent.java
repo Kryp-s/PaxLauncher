@@ -11,7 +11,7 @@ import javax.tools.ToolProvider;
  * і з обфускованими, і з модовими збірками. Агент збирається один раз із вбудованого коду (потрібна Java з компілятором).
  */
 final class LanAgent {
-    private static final String VER = "6";
+    private static final String VER = "7";
 
     private LanAgent() { }
 
@@ -115,37 +115,61 @@ public final class PaxLanAgent {
         Path lock = Paths.get(a[1], a[2], "session.lock");
         Path flag = Paths.get(a[3]);
         long start = System.currentTimeMillis() - 5000L;
-        long done = 0L;
-        long seen = 0L;
-        int tries = 0;
-        Method pub = null;
-        Method getSrv = null;
-        Field self = null;
-        Method auth = null;
-        boolean authTried = false;
         boolean offline = "1".equals(a[4]);
         long end = System.currentTimeMillis() + 8L * 60L * 60L * 1000L;
+        Method pub = null;
+        Method getSrv = null;
+        Method gameType = null;
+        Field self = null;
+        boolean legacy = false;
+        Method auth = null;
+        boolean authTried = false;
+        Object cur = null;
+        long seenAt = 0L;
+        long lastLocate = 0L;
+        long nextTry = 0L;
+        boolean done = false;
+        int fails = 0;
+        int lastPort = -1;
+        int[] base = null;
         while (System.currentTimeMillis() < end) {
-            try { Thread.sleep(1500L); } catch (InterruptedException e) { return; }
-            long lm = mtime(lock);
-            if (lm < start || lm <= done) continue;
-            if (seen != lm) { seen = lm; tries = 0; say("WORLD"); }
-            long fm = mtime(flag);
-            boolean joined = fm >= lm || System.currentTimeMillis() - lm > 12000L;
-            if (!joined) continue;
-            if (tries++ > 8) { done = lm; say("FAIL gave up"); continue; }
+            try { Thread.sleep(1000L); } catch (InterruptedException e) { return; }
+            long now = System.currentTimeMillis();
             try {
-                Thread.sleep(1500L);
+                // агент «озбройюється», коли гравець уже у світі: або лаунчер побачив «joined the game», або свіжий session.lock
+                long fm = mtime(flag);
+                long lm = mtime(lock);
+                boolean armed = fm >= start || (lm >= start && now - lm > 12000L);
+                if (!armed) continue;
                 if (pub == null) {
+                    if (now - lastLocate < 8000L) continue;
+                    lastLocate = now;
                     Object[] f = locate(inst);
                     if (f == null) { say("NOCLASS"); continue; }
                     pub = (Method) f[0];
                     getSrv = (Method) f[1];
                     self = (Field) f[2];
+                    legacy = ((Boolean) f[3]).booleanValue();
+                    gameType = legacy ? findGameType(pub.getDeclaringClass(), pub.getParameterTypes()[0]) : null;
+                    say("READY " + (legacy ? "legacy " : "") + pub.getDeclaringClass().getName());
                 }
                 Object mc = self.get(null);
-                Object server = getSrv.invoke(mc);
-                if (server == null) continue;
+                Object server = mc == null ? null : getSrv.invoke(mc);
+                if (server == null) { cur = null; continue; }
+                if (server != cur) {
+                    cur = server;
+                    seenAt = now;
+                    done = false;
+                    fails = 0;
+                    lastPort = -1;
+                    nextTry = 0L;
+                    base = snapshot(server, pub.getDeclaringClass());
+                    say("WORLD");
+                }
+                // світ могли відкрити вручну (Пауза → Відкрити для мережі): беремо порт із самого сервера, мова чату не важлива
+                int pp = livePort(server, pub.getDeclaringClass(), base);
+                if (pp > 0 && pp != lastPort) { lastPort = pp; done = true; say("PORT " + pp); }
+                if (done || now < nextTry || now - seenAt < 2500L) continue;
                 if (offline && !authTried) {
                     authTried = true;
                     try {
@@ -157,15 +181,88 @@ public final class PaxLanAgent {
                     try { auth.invoke(server, Boolean.FALSE); say("OFFLINE on"); }
                     catch (Throwable e) { say("NOOFFLINE " + e); }
                 }
-                Object res = pub.invoke(server, null, Boolean.FALSE, Integer.valueOf(port));
-                done = lm;
-                if (Boolean.TRUE.equals(res)) say("PUBLISHED " + port);
-                else say("FAIL publish returned false (port " + port + " busy?)");
+                if (legacy) {
+                    Object gt = gameType == null ? null : gameType.invoke(server);
+                    if (gt == null) {
+                        Object[] cs = pub.getParameterTypes()[0].getEnumConstants();
+                        gt = cs != null && cs.length > 1 ? cs[1] : (cs != null && cs.length > 0 ? cs[0] : null);
+                    }
+                    Object res = pub.invoke(server, gt, Boolean.FALSE);
+                    int p = 0;
+                    try { p = Integer.parseInt(String.valueOf(res).trim()); } catch (Throwable ignored) { }
+                    done = true;
+                    if (p > 0) { lastPort = p; say("PORT " + p); }
+                    else say("PUBLISHED");
+                } else {
+                    Object res = pub.invoke(server, null, Boolean.FALSE, Integer.valueOf(port));
+                    if (Boolean.TRUE.equals(res)) { done = true; lastPort = port; say("PUBLISHED " + port); say("PORT " + port); }
+                    else {
+                        int now2 = livePort(server, pub.getDeclaringClass(), base);
+                        if (now2 > 0) { done = true; lastPort = now2; say("PORT " + now2); }
+                        else {
+                            fails++;
+                            say("RETRY publish returned false (port " + port + " busy?)");
+                            if (fails >= 2) port = freePort();
+                            nextTry = now + (fails < 30 ? 2000L : 10000L);
+                        }
+                    }
+                }
             } catch (Throwable e) {
                 Throwable c = e.getCause() != null ? e.getCause() : e;
-                say("RETRY " + c);
+                fails++;
+                if (fails <= 3 || fails % 10 == 0) say("RETRY " + c);
+                nextTry = System.currentTimeMillis() + (fails < 30 ? 2000L : 10000L);
             }
         }
+    }
+
+    private static int freePort() {
+        try {
+            java.net.ServerSocket s = new java.net.ServerSocket(0);
+            try { return s.getLocalPort(); } finally { s.close(); }
+        } catch (Throwable e) { return 25565; }
+    }
+
+    /** Значення int-полів сервера на момент появи світу (publishedPort там -1, лічильники — 0 і більше). */
+    private static int[] snapshot(Object server, Class<?> c) {
+        try {
+            Field[] fs = c.getDeclaredFields();
+            int[] r = new int[fs.length];
+            for (int i = 0; i < fs.length; i++) {
+                r[i] = Integer.MIN_VALUE;
+                if (fs[i].getType() != int.class || Modifier.isStatic(fs[i].getModifiers())) continue;
+                try { fs[i].setAccessible(true); r[i] = fs[i].getInt(server); } catch (Throwable ignored) { }
+            }
+            return r;
+        } catch (Throwable e) { return null; }
+    }
+
+    /** Порт, на якому світ відкрито для мережі, або -1. Шукає int-поле, що було -1, а стало портом. */
+    private static int livePort(Object server, Class<?> c, int[] base) {
+        if (base == null) return -1;
+        try {
+            Field[] fs = c.getDeclaredFields();
+            for (int i = 0; i < fs.length && i < base.length; i++) {
+                if (base[i] != -1) continue;
+                try {
+                    int v = fs[i].getInt(server);
+                    if (v >= 1024 && v <= 65535) return v;
+                } catch (Throwable ignored) { }
+            }
+        } catch (Throwable ignored) { }
+        return -1;
+    }
+
+    /** Метод без аргументів, що повертає ігровий режим (для старих версій, де shareToLAN не приймає null). */
+    private static Method findGameType(Class<?> c, Class<?> type) {
+        for (Class<?> k = c; k != null && k != Object.class; k = k.getSuperclass()) {
+            for (Method m : k.getDeclaredMethods()) {
+                if (m.getParameterTypes().length == 0 && m.getReturnType() == type && !Modifier.isStatic(m.getModifiers())) {
+                    try { open(null, k); m.setAccessible(true); return m; } catch (Throwable ignored) { }
+                }
+            }
+        }
+        return null;
     }
 
     private static void skip(DataInputStream d, int n) throws java.io.IOException {
@@ -286,20 +383,23 @@ public final class PaxLanAgent {
         Class<?>[] all = inst.getAllLoadedClasses();
         Class<?> srv = null;
         Method pub = null;
-        for (Class<?> c : all) {
-            if (!candidate(c)) continue;
-            try {
-                for (Method m : c.getDeclaredMethods()) {
-                    Class<?>[] p = m.getParameterTypes();
-                    if (p.length == 3 && p[0].isEnum() && p[1] == boolean.class && p[2] == int.class
-                            && m.getReturnType() == boolean.class && !Modifier.isStatic(m.getModifiers())) {
-                        srv = c;
-                        pub = m;
-                        break;
+        boolean legacy = false;
+        // 1.16+: publishServer(GameType, boolean, int) -> boolean; 1.12–1.15: shareToLAN(GameType, boolean) -> String
+        for (int pass = 0; pass < 2 && pub == null; pass++) {
+            for (Class<?> c : all) {
+                if (!candidate(c)) continue;
+                try {
+                    for (Method m : c.getDeclaredMethods()) {
+                        Class<?>[] p = m.getParameterTypes();
+                        if (Modifier.isStatic(m.getModifiers())) continue;
+                        boolean ok = pass == 0
+                                ? p.length == 3 && p[0].isEnum() && p[1] == boolean.class && p[2] == int.class && m.getReturnType() == boolean.class
+                                : p.length == 2 && p[0].isEnum() && p[1] == boolean.class && m.getReturnType() == String.class;
+                        if (ok) { srv = c; pub = m; legacy = pass == 1; break; }
                     }
-                }
-            } catch (Throwable ignored) { }
-            if (pub != null) break;
+                } catch (Throwable ignored) { }
+                if (pub != null) break;
+            }
         }
         if (pub == null) return null;
         open(inst, srv);
@@ -317,7 +417,7 @@ public final class PaxLanAgent {
                         open(inst, c);
                         self.setAccessible(true);
                         m.setAccessible(true);
-                        return new Object[] { pub, m, self };
+                        return new Object[] { pub, m, self, Boolean.valueOf(legacy) };
                     }
                 }
             } catch (Throwable ignored) { }

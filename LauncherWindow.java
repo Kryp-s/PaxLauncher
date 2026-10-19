@@ -1545,6 +1545,7 @@ final class LauncherWindow extends JFrame {
     volatile String joinTarget, pendingJoin, joinCode, hostWorld;
     volatile int hostLanPort;
     volatile String hostAgentMsg;
+    volatile boolean hostManualJoin;   // версія без --quickPlaySingleplayer: гравець заходить у світ сам
     volatile boolean hostAlive;
     javax.swing.Timer lanTimer;
     volatile Process joinProc;         // гра, запущена для приєднання
@@ -1552,7 +1553,7 @@ final class LauncherWindow extends JFrame {
     Field inviteOut;
     JLabel inviteNoteL, hostWorldL;
     Combo<String> hostPlayers, hostBanned;
-    static final Pattern LAN_PORT = Pattern.compile("(?iu)\\[CHAT\\].*?\\b(?:port|порт\\p{L}*)\\D{0,6}(\\d{4,5})");
+    static final Pattern LAN_PORT = Pattern.compile("(?iu)\\[CHAT\\].*?(?:port|puert|порт|prt)\\p{L}*\\D{0,6}(\\d{4,5})");
 
     Btn hostBtn;
     final JLabel friendsNote = label(" ", 11, false, Theme.MUTED);
@@ -1638,6 +1639,10 @@ final class LauncherWindow extends JFrame {
         LanProxy l = lan;
         if (l != null && ln != null && ln.contains("[PaxLan]")) {
             hostAgentMsg = ln.substring(ln.indexOf("[PaxLan]") + 8).trim();
+            if (hostAgentMsg.startsWith("PORT ")) {
+                // агент побачив порт, на якому світ відкрито для мережі (автоматично чи вручну) — спрямовуємо сесію туди
+                try { l.setTarget(Integer.parseInt(hostAgentMsg.substring(5).trim())); } catch (NumberFormatException ignored) { }
+            }
             SwingUtilities.invokeLater(this::refreshHostUi);
         }
         if (l != null && hostLanPort > 0 && ln != null && ln.contains(" joined the game")) {
@@ -1664,13 +1669,15 @@ final class LauncherWindow extends JFrame {
     String agentText() {
         String m = hostAgentMsg == null ? "" : hostAgentMsg;
         String manual = I18n.t(" Відкрий світ вручну: Пауза → Відкрити для мережі.");
-        if (m.startsWith("PUBLISHED")) return I18n.t("Світ відкрито для мережі…");
+        if (m.startsWith("PUBLISHED") || m.startsWith("PORT")) return I18n.t("Світ відкрито для мережі…");
         if (m.startsWith("WORLD")) return I18n.t("Ти у світі — відкриваю його для друзів…");
         if (m.startsWith("NOCLASS")) return I18n.t("Агент не знайшов потрібні класи гри.") + manual;
         if (m.startsWith("NOOFFLINE")) return I18n.t("Не вдалося дозволити неліцензійних гравців — вони не зайдуть.");
         if (m.startsWith("OFFLINE")) return I18n.t("Неліцензійні гравці дозволені…");
         if (m.startsWith("FAIL") || m.startsWith("RETRY")) return I18n.t("Автоматично не вийшло (") + m + ")." + manual;
         if (m.startsWith("LOADED")) return I18n.t("Агент підключено. Чекаю, поки ти зайдеш у світ «") + hostWorld + "»…";
+        if (hostManualJoin) return I18n.t("У цій версії гра не вміє заходити у світ сама: відкрий світ «") + hostWorld
+                + I18n.t("» вручну (Одиночна гра) — він відкриється для друзів, щойно ти зайдеш.");
         return I18n.t("Чекаю, поки ти зайдеш у світ «") + hostWorld + "»…";
     }
 
@@ -1776,6 +1783,7 @@ final class LauncherWindow extends JFrame {
         hostWorld = null;
         hostLanPort = 0;
         hostAgentMsg = null;
+        hostManualJoin = false;
         hostAlive = false;
         if (lanTimer != null) { lanTimer.stop(); lanTimer = null; }
         try { Files.deleteIfExists(flagPath()); } catch (IOException ignored) { }
@@ -5961,8 +5969,10 @@ final class LauncherWindow extends JFrame {
                         Files.writeString(cfgf, hport + "\n" + gd.resolve("saves") + "\n" + hw + "\n" + flag + "\n"
                                 + (cfg.getb("allowOffline", false) ? "1" : "0") + "\n", java.nio.charset.StandardCharsets.UTF_8);
                         cmd.add(1, "-javaagent:" + ag + "=" + cfgf);
-                        if (Invite.modern(mcj)) { cmd.add("--quickPlaySingleplayer"); cmd.add(hw); }
-                        log(I18n.t("Світ «") + hw + I18n.t("» відкриється для друзів, щойно ти в нього зайдеш."));
+                        hostManualJoin = !Invite.modern(mcj);
+                        if (!hostManualJoin) { cmd.add("--quickPlaySingleplayer"); cmd.add(hw); }
+                        log(I18n.t("Світ «") + hw + I18n.t("» відкриється для друзів, щойно ти в нього зайдеш.")
+                                + (hostManualJoin ? I18n.t(" (ця версія не заходить у світ сама — обери його в «Одиночна гра»)") : ""));
                     } catch (Throwable ex) {
                         log(I18n.t("Авто-відкриття світу недоступне: ") + ex.getMessage());
                     }
