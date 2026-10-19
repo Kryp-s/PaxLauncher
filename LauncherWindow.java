@@ -1197,8 +1197,6 @@ final class LauncherWindow extends JFrame {
     }
 
     void exit() {
-        try { hostStop(); } catch (Throwable ignored) { }
-        try { Upnp.closeAll(); } catch (Throwable ignored) { }
         try { saveVersion(); } catch (Throwable ignored) { }
         try { dispose(); } catch (Throwable ignored) { }
         Thread w = new Thread(() -> {
@@ -1418,8 +1416,8 @@ final class LauncherWindow extends JFrame {
         rp.row(header(I18n.t("Поточна обліківка")), 0);
         rp.row(accountTile(), 12);
 
-        rp.row(header(I18n.t("Гра з другом")), 26);
-        rp.row(friendsCard(), 8);
+        rp.row(header(I18n.t("Швидкі дії")), 26);
+        rp.row(quickActions(), 8);
 
         rp.row(header(I18n.t("Сервери Minecraft")), 26);
         rp.row(new ServerAds(this::browse), 12);
@@ -1538,489 +1536,27 @@ final class LauncherWindow extends JFrame {
         return p;
     }
 
-    // ---------- «Гра з другом» ----------
-    LanProxy lan;                      // активна сесія хоста
-    volatile String inviteCode;        // код активної сесії хоста
-    volatile String inviteNote = " ";
-    volatile String joinTarget, pendingJoin, joinCode, hostWorld;
-    volatile int hostLanPort;
-    volatile String hostAgentMsg;
-    volatile boolean hostManualJoin;   // версія без --quickPlaySingleplayer: гравець заходить у світ сам
-    volatile boolean hostAlive;
-    javax.swing.Timer lanTimer;
-    volatile Process joinProc;         // гра, запущена для приєднання
-    final JLabel friendsLbl = label(" ", 12, false, Theme.MUTED);
-    Field inviteOut;
-    JLabel inviteNoteL, hostWorldL;
-    Combo<String> hostPlayers, hostBanned;
-    static final Pattern LAN_PORT = Pattern.compile("(?iu)\\[CHAT\\].*?(?:port|puert|порт|prt)\\p{L}*\\D{0,6}(\\d{4,5})");
-
-    Btn hostBtn;
-    final JLabel friendsNote = label(" ", 11, false, Theme.MUTED);
-
-    JPanel friendsCard() {
-        Btn jb = small(new Btn(I18n.t("Приєднатися"), Btn.Kind.SECONDARY));
-        Btn hb = small(new Btn(I18n.t("Створити"), Btn.Kind.PRIMARY));
-        hostBtn = hb;
-        jb.addActionListener(e -> openJoin());
-        hb.addActionListener(e -> openHost());
-        JPanel row = new JPanel(new GridLayout(2, 1, 0, 8));
-        row.setOpaque(false);
-        row.add(jb);
-        row.add(hb);
-        JPanel p = new JPanel(new BorderLayout(0, 8));
-        p.setOpaque(false);
-        p.add(row, BorderLayout.NORTH);
-        JPanel info = new JPanel(new BorderLayout(0, 6));
-        info.setOpaque(false);
-        info.add(friendsLbl, BorderLayout.NORTH);
-        info.add(friendsNote, BorderLayout.CENTER);
-        p.add(info, BorderLayout.CENTER);
-        // клік по «Сесія: PAX-…» копіює код
-        friendsLbl.addMouseListener(new MouseAdapter() {
-            @Override public void mouseClicked(MouseEvent e) {
-                String c = inviteCode;
-                if (lan == null || c == null) return;
-                copyText(c);
-                friendsLbl.setText(I18n.t("Код скопійовано"));
-                javax.swing.Timer t = new javax.swing.Timer(1300, ev -> refreshFriendsCard());
-                t.setRepeats(false);
-                t.start();
-            }
-        });
-        return p;
-    }
-
-    void refreshFriendsCard() {
-        String t = " ";
-        if (lan != null) {
-            if (inviteCode == null) t = I18n.t("Створюю сесію…");
-            else if (hostAlive) t = I18n.t("Сесія: ") + inviteCode;
-            else t = "<html>" + I18n.t("Сесія: ") + inviteCode + "<br>" + I18n.t("світ ще не відкрито") + "</html>";
-        }
-        else if (joinCode != null) t = I18n.t("Приєднано: ") + joinCode;
-        friendsLbl.setText(t);
-        friendsNote.setText(lan != null
-                ? "<html><div style='width:170px'>" + I18n.t("Якщо закрити запускач — сервер вимкнеться.") + "</div></html>" : " ");
-        if (hostBtn != null) {
-            hostBtn.setText(lan != null ? I18n.t("Налаштування") : I18n.t("Створити"));
-            hostBtn.revalidate(); hostBtn.repaint();
-        }
-        friendsLbl.setCursor(Cursor.getPredefinedCursor(lan != null && inviteCode != null ? Cursor.HAND_CURSOR : Cursor.DEFAULT_CURSOR));
-    }
-
-    /** Слідкує за логом гри: коли хост відкрив світ для мережі, сесія спрямовує гравців у нього. */
-    Path flagPath() { return root.resolve("runtime").resolve("lan-joined.flag"); }
-
-    static String wrapHtml(String s) {
-        if (s == null || s.trim().isEmpty()) return " ";
-        return "<html><div style='width:380px'>" + s.replace("&", "&amp;").replace("<", "&lt;") + "</div></html>";
-    }
-
-    static List<String> worldsOf(Path inst) {
-        List<String> out = new ArrayList<>();
-        Path saves = inst.resolve("saves");
-        if (!Files.isDirectory(saves)) return out;
-        try (var st = Files.list(saves)) {
-            st.filter(p -> Files.isRegularFile(p.resolve("level.dat"))).forEach(p -> out.add(p.getFileName().toString()));
-        } catch (IOException ignored) { }
-        out.sort(String.CASE_INSENSITIVE_ORDER);
-        return out;
-    }
-
-    static int freePort(int from) {
-        for (int p = from; p < from + 60; p++) {
-            try (java.net.ServerSocket s = new java.net.ServerSocket(p)) { return p; } catch (IOException ignored) { }
-        }
-        return from;
-    }
-
-    void inviteHook(String ln) {
-        LanProxy l = lan;
-        if (l != null && ln != null && ln.contains("[PaxLan]")) {
-            hostAgentMsg = ln.substring(ln.indexOf("[PaxLan]") + 8).trim();
-            if (hostAgentMsg.startsWith("PORT ")) {
-                // агент побачив порт, на якому світ відкрито для мережі (автоматично чи вручну) — спрямовуємо сесію туди
-                try { l.setTarget(Integer.parseInt(hostAgentMsg.substring(5).trim())); } catch (NumberFormatException ignored) { }
-            }
-            SwingUtilities.invokeLater(this::refreshHostUi);
-        }
-        if (l != null && hostLanPort > 0 && ln != null && (ln.contains(" joined the game")
-                || (ln.contains(" logged in with entity id ") && ln.contains("[local:")))) {
-            // сигнал агенту в грі: хост зайшов у світ — можна відкривати його для мережі.
-            // Рядок «logged in with entity id» не залежить від мови гри (чат може бути українською), на відміну від «joined the game».
-            try {
-                Path f = flagPath();
-                Files.createDirectories(f.getParent());
-                Files.writeString(f, String.valueOf(System.nanoTime()));
-            } catch (IOException ignored) { }
-        }
-        if (l == null || ln == null || !ln.contains("[CHAT]")) return;
-        java.util.regex.Matcher m = LAN_PORT.matcher(ln);
-        if (m.find()) {
-            try { l.setTarget(Integer.parseInt(m.group(1))); } catch (NumberFormatException ignored) { }
-            SwingUtilities.invokeLater(this::refreshHostUi);
-        }
-    }
-
-    void copyText(String t) {
-        try { Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new java.awt.datatransfer.StringSelection(t), null); }
-        catch (Throwable ignored) { }
-    }
-
-    String agentText() {
-        String m = hostAgentMsg == null ? "" : hostAgentMsg;
-        String manual = I18n.t(" Відкрий світ вручну: Пауза → Відкрити для мережі.");
-        if (m.startsWith("PUBLISHED") || m.startsWith("PORT")) return I18n.t("Світ відкрито для мережі…");
-        if (m.startsWith("WORLD")) return I18n.t("Ти у світі — відкриваю його для друзів…");
-        if (m.startsWith("NOCLASS")) return I18n.t("Агент не знайшов потрібні класи гри.") + manual;
-        if (m.startsWith("NOOFFLINE")) return I18n.t("Не вдалося дозволити неліцензійних гравців — вони не зайдуть.");
-        if (m.startsWith("OFFLINE")) return I18n.t("Неліцензійні гравці дозволені…");
-        if (m.startsWith("FAIL") || m.startsWith("RETRY")) return I18n.t("Автоматично не вийшло (") + m + ")." + manual;
-        if (m.startsWith("LOADED")) return I18n.t("Агент підключено. Чекаю, поки ти зайдеш у світ «") + hostWorld + "»…";
-        if (hostManualJoin) return I18n.t("У цій версії гра не вміє заходити у світ сама: відкрий світ «") + hostWorld
-                + I18n.t("» вручну (Одиночна гра) — він відкриється для друзів, щойно ти зайдеш.");
-        return I18n.t("Чекаю, поки ти зайдеш у світ «") + hostWorld + "»…";
-    }
-
-    static void fillCombo(Combo<String> cb, List<String> items) {
-        if (cb == null) return;
-        List<String> cur = new ArrayList<>();
-        for (int i = 0; i < cb.getItemCount(); i++) cur.add(cb.getItemAt(i));
-        if (cur.equals(items)) return;
-        Object sel = cb.getSelectedItem();
-        cb.removeAllItems();
-        for (String x : items) cb.addItem(x);
-        if (sel != null && items.contains(String.valueOf(sel))) cb.setSelectedItem(sel);
-    }
-
-    void saveBans() {
-        LanProxy l = lan;
-        if (l != null) { cfg.set("hostBans", String.join(",", l.banEntries())); cfg.save(); }
-    }
-
-    void refreshHostUi() {
-        LanProxy l = lan;
-        if (l != null) { fillCombo(hostPlayers, l.playerNames()); fillCombo(hostBanned, l.bans()); }
-        if (inviteOut != null) inviteOut.setText(inviteCode == null ? "" : inviteCode);
-        if (inviteNoteL != null) inviteNoteL.setText(wrapHtml(inviteNote));
-        if (hostWorldL != null && l != null) {
-            new Thread(() -> {
-                boolean a = l.alive();
-                int n = l.players();
-                SwingUtilities.invokeLater(() -> {
-                    if (hostWorldL != null) hostWorldL.setText(a ? I18n.t("Світ відкрито · гравців зараз: ") + n
-                            : hostWorld != null ? agentText()
-                            : I18n.t("Чекаю, поки ти відкриєш світ для мережі…"));
-                });
-            }, "host-state").start();
-        }
-    }
-
-    /** Створює сесію: випадковий порт, UPnP, код запрошення. Код чинний, доки сесія активна. */
-    void hostStart() {
-        if (lan != null) return;
-        Accounts.Acc acc = accounts.current();
-        LanProxy l = new LanProxy(acc == null ? "" : acc.name());
-        l.setBans(Arrays.asList(cfg.get("hostBans", "").split(",")));
-        int port = 0;
-        Random rnd = new Random();
-        for (int i = 0; i < 60 && port == 0; i++) {
-            boolean reuse = i == 0 && cfg.getb("noUpnp", false) && cfg.geti("hostPort", 0) > 0;
-            int p = reuse ? cfg.geti("hostPort", 0) : 30000 + rnd.nextInt(30000);
-            try { l.start(p); port = p; } catch (IOException ignored) { }
-        }
-        if (port == 0) { msg(I18n.t("Не вдалося відкрити порт для сесії.")); return; }
-        final int fport = port;
-        lan = l;
-        inviteCode = null;
-        inviteNote = " ";
-        hostAlive = false;
-        if (lanTimer != null) lanTimer.stop();
-        lanTimer = new javax.swing.Timer(3000, e -> {
-            LanProxy cur = lan;
-            if (cur == null) return;
-            new Thread(() -> {
-                boolean al = cur.alive();
-                if (al != hostAlive) {
-                    hostAlive = al;
-                    SwingUtilities.invokeLater(this::refreshFriendsCard);
-                }
-            }, "lan-alive").start();
-        });
-        lanTimer.start();
-        refreshFriendsCard();
-        new Thread(() -> {
-            Upnp.Result r = Upnp.open(fport);
-            SwingUtilities.invokeLater(() -> {
-                if (lan != l) { Upnp.close(fport); return; }
-                String code = r.ip == null ? null : Invite.encode(r.ip, fport);
-                if (code == null) {
-                    hostStop();
-                    msg(I18n.t(r.note));
-                    return;
-                }
-                inviteCode = code;
-                inviteNote = r.note;
-                cfg.set("noUpnp", String.valueOf(!r.mapped));
-                if (!r.mapped) cfg.set("hostPort", String.valueOf(fport));
-                cfg.save();
-                copyText(code);
-                log(I18n.t("Код сесії: ") + code + (r.note.trim().isEmpty() ? "" : "  ·  " + r.note));
-                refreshFriendsCard();
-                refreshHostUi();
-            });
-        }, "host-open").start();
-    }
-
-    void hostStop() {
-        LanProxy l = lan;
-        lan = null;
-        if (l != null) {
-            l.stop();
-            try { Upnp.close(l.port()); } catch (Throwable ignored) { }
-        }
-        inviteCode = null;
-        inviteNote = " ";
-        hostWorld = null;
-        hostLanPort = 0;
-        hostAgentMsg = null;
-        hostManualJoin = false;
-        hostAlive = false;
-        if (lanTimer != null) { lanTimer.stop(); lanTimer = null; }
-        try { Files.deleteIfExists(flagPath()); } catch (IOException ignored) { }
-        SwingUtilities.invokeLater(this::refreshFriendsCard);
-    }
-
-    Path dirOf(VItem it) {
-        return it.profile() != null ? instDir(it.profile()) : Path.of(cfg.get("gameDir", root.toString()));
-    }
-
-    void openHost() {
-        final boolean active = lan != null;
-        final Btn[] okRef = new Btn[1];
-        final Runnable[] gateRef = {() -> { }};
-        javax.swing.Timer tm = null;
-        Combo<VItem> vc = new Combo<>();
-        Combo<String> wc = new Combo<>();
-        Check offC = new Check(I18n.t("Дозволяти вхід з неліцензійних акаунтів"), cfg.getb("allowOffline", false));
-        offC.setFont(Theme.font(Font.PLAIN, 13));
-        JPanel pn = new JPanel();
-        pn.setOpaque(false);
-        pn.setLayout(new BoxLayout(pn, BoxLayout.Y_AXIS));
-        if (!active) {
-            VItem cur = versions.getSelectedItem() instanceof VItem ? (VItem) versions.getSelectedItem() : null;
-            for (int i = 0; i < versions.getItemCount(); i++) {
-                VItem it = versions.getItemAt(i);
-                if (it.installed()) vc.addItem(it);
-            }
-            if (cur != null) vc.setSelectedItem(cur);
-            Runnable reload = () -> {
-                wc.removeAllItems();
-                Object o = vc.getSelectedItem();
-                if (o instanceof VItem) for (String w : worldsOf(dirOf((VItem) o))) wc.addItem(w);
-                gateRef[0].run();
-            };
-            vc.addActionListener(e -> reload.run());
-            wc.addActionListener(e -> gateRef[0].run());
-            for (JComponent c : new JComponent[]{vc, wc}) {
-                c.setPreferredSize(new Dimension(200, 38));
-                c.setMaximumSize(new Dimension(Integer.MAX_VALUE, 38));
-            }
-            wc.placeholder = I18n.t("У цій збірці ще немає світів");
-            for (JComponent c : new JComponent[]{
-                    label(I18n.t("Версія або збірка"), 12, true, Theme.MUTED), vc,
-                    label(" ", 6, false, Theme.MUTED),
-                    label(I18n.t("Світ, який відкриється для друзів"), 12, true, Theme.MUTED), wc,
-                    label(" ", 6, false, Theme.MUTED), offC}) {
-                c.setAlignmentX(Component.LEFT_ALIGNMENT);
-                pn.add(c);
-            }
-            gateRef[0] = () -> { if (okRef[0] != null) okRef[0].setEnabled(vc.getSelectedItem() != null && wc.getSelectedItem() != null); };
-            reload.run();
-        } else {
-            inviteOut = new Field(inviteCode == null ? "" : inviteCode);
-            inviteOut.setEditable(false);
-            inviteOut.setHint(I18n.t("Створюю код…"));
-            inviteOut.setPreferredSize(new Dimension(200, 38));
-            inviteOut.setMaximumSize(new Dimension(Integer.MAX_VALUE, 38));
-            Btn copy = tiny(new Btn(I18n.t("Копіювати"), Btn.Kind.SECONDARY));
-            copy.addActionListener(e -> { String t = inviteOut.getText(); if (!t.isEmpty()) copyText(t); });
-            JPanel codeRow = new JPanel(new BorderLayout(8, 0));
-            codeRow.setOpaque(false);
-            codeRow.add(inviteOut, BorderLayout.CENTER);
-            codeRow.add(copy, BorderLayout.EAST);
-            hostWorldL = label(" ", 12, false, Theme.MUTED);
-            hostWorldL.setPreferredSize(new Dimension(Theme.px(400), Theme.px(40)));
-            hostWorldL.setVerticalAlignment(SwingConstants.TOP);
-            hostPlayers = new Combo<>();
-            hostPlayers.placeholder = I18n.t("Нікого немає");
-            hostBanned = new Combo<>();
-            hostBanned.placeholder = I18n.t("Список порожній");
-            for (JComponent c : new JComponent[]{hostPlayers, hostBanned}) {
-                c.setPreferredSize(new Dimension(200, 38));
-                c.setMaximumSize(new Dimension(Integer.MAX_VALUE, 38));
-            }
-            Btn kickB = tiny(new Btn(I18n.t("Від'єднати"), Btn.Kind.SECONDARY));
-            Btn banB = tiny(new Btn(I18n.t("Забанити"), Btn.Kind.SECONDARY));
-            Btn unbanB = tiny(new Btn(I18n.t("Розбанити"), Btn.Kind.SECONDARY));
-            kickB.addActionListener(e -> {
-                Object n = hostPlayers.getSelectedItem();
-                if (lan != null && n != null) { lan.kick(String.valueOf(n)); refreshHostUi(); }
-            });
-            banB.addActionListener(e -> {
-                Object n = hostPlayers.getSelectedItem();
-                if (lan != null && n != null) { lan.ban(String.valueOf(n)); saveBans(); refreshHostUi(); }
-            });
-            unbanB.addActionListener(e -> {
-                Object n = hostBanned.getSelectedItem();
-                if (lan != null && n != null) { lan.unban(String.valueOf(n)); saveBans(); refreshHostUi(); }
-            });
-            JPanel pBtns = new JPanel(new GridLayout(1, 2, 6, 0));
-            pBtns.setOpaque(false);
-            pBtns.add(kickB);
-            pBtns.add(banB);
-            JPanel pRow = new JPanel(new BorderLayout(8, 0));
-            pRow.setOpaque(false);
-            pRow.add(hostPlayers, BorderLayout.CENTER);
-            pRow.add(pBtns, BorderLayout.EAST);
-            JPanel bRow = new JPanel(new BorderLayout(8, 0));
-            bRow.setOpaque(false);
-            bRow.add(hostBanned, BorderLayout.CENTER);
-            bRow.add(unbanB, BorderLayout.EAST);
-            for (JComponent c : new JComponent[]{
-                    label(I18n.t("Код сесії — скинь його друзям:"), 12, true, Theme.MUTED), codeRow, hostWorldL,
-                    label(I18n.t("Гравці в сесії"), 12, true, Theme.MUTED), pRow,
-                    label(I18n.t("Забанені"), 12, true, Theme.MUTED), bRow}) {
-                c.setAlignmentX(Component.LEFT_ALIGNMENT);
-                pn.add(c);
-                pn.add(Box.createVerticalStrut(5));
-            }
-            refreshHostUi();
-            tm = new javax.swing.Timer(2000, e -> refreshHostUi());
-            tm.start();
-        }
-        pn.setPreferredSize(new Dimension(Theme.px(440), pn.getPreferredSize().height));
-        boolean ok = Dlg.show(this, I18n.t("Створити сесію"), pn, active ? I18n.t("Вимкнути сесію") : I18n.t("Створити"),
-                I18n.t("Закрити"), null, b -> { okRef[0] = b; gateRef[0].run(); });
-        if (tm != null) tm.stop();
-        inviteOut = null;
-        inviteNoteL = null;
-        hostWorldL = null;
-        hostPlayers = null;
-        hostBanned = null;
-        if (!ok) return;
-        if (active) { hostStop(); status.setText(I18n.t("Сесію вимкнено")); return; }
-        cfg.set("allowOffline", String.valueOf(offC.isSelected()));
-        cfg.save();
-        Object so = vc.getSelectedItem();
-        Object w = wc.getSelectedItem();
-        if (!(so instanceof VItem) || w == null) return;
-        if (!running.isEmpty()) {
-            msg(I18n.t("Спочатку закрий запущену гру: світ відкриється для друзів сам, якщо запустити її через «Створити»."));
-            return;
-        }
-        hostStart();
-        if (lan == null) return;
-        hostWorld = String.valueOf(w);
-        hostLanPort = freePort(25565);
-        lan.setTarget(hostLanPort);
-        fillVersions(((VItem) so).key());
-        play();
-    }
-
-    void openJoin() {
-        if (joinCode != null) {
-            JPanel pn = new JPanel();
-            pn.setOpaque(false);
-            pn.setLayout(new BoxLayout(pn, BoxLayout.Y_AXIS));
-            JLabel a = label(I18n.t("Ти приєднаний до сесії ") + joinCode, 13, true, Theme.TEXT);
-            a.setAlignmentX(Component.LEFT_ALIGNMENT);
-            pn.add(a);
-            pn.setPreferredSize(new Dimension(Theme.px(400), pn.getPreferredSize().height + 6));
-            if (Dlg.show(this, I18n.t("Приєднатися"), pn, I18n.t("Від'єднатися"), I18n.t("Закрити"))) joinDisconnect();
-            return;
-        }
-        Field codeIn = new Field("");
-        codeIn.setHint(I18n.t("Код: PAX-XXXX-XXXX-XXXX"));
-        codeIn.setPreferredSize(new Dimension(Theme.px(400), 38));
-        final Btn[] okRef = new Btn[1];
-        Runnable gate = () -> { if (okRef[0] != null) okRef[0].setEnabled(Invite.decode(codeIn.getText()) != null); };
-        codeIn.getDocument().addDocumentListener(simpleDoc(gate));
-        boolean ok = Dlg.show(this, I18n.t("Приєднатися"), codeIn, I18n.t("Приєднатися"), I18n.t("Скасувати"), null,
-                b -> { okRef[0] = b; gate.run(); });
-        if (ok) joinWithCode(codeIn.getText());
-    }
-
-    void joinWithCode(String code) {
-        String[] t = Invite.decode(code);
-        if (t == null) { msg(I18n.t("Невірний код запрошення.")); return; }
-        if (joinCode != null) { msg(I18n.t("Ти вже приєднаний до сесії.")); return; }
-        String ip = t[0];
-        int port = Integer.parseInt(t[1]);
-        String norm = Invite.encode(ip, port);
-        status.setText(I18n.t("Перевіряю сесію…"));
-        new Thread(() -> {
-            // той самий комп'ютер (інший екземпляр лаунчера): ходимо через 127.0.0.1, без петлі через роутер
-            String me = Upnp.publicIp();
-            final String tgt = me != null && me.equals(ip) ? "127.0.0.1" : ip;
-            int st = LanProxy.probe(tgt, port);
-            SwingUtilities.invokeLater(() -> {
-                status.setText(" ");
-                if (st == 2) { msg(I18n.t("Сесія неактивна: хост її вимкнув, або код застарів.")); return; }
-                if (st == 1) { msg(I18n.t("Хост ще не відкрив світ для мережі. Спробуй трохи пізніше.")); return; }
-                // запис «Гра з друзями» додаємо в список серверів усіх збірок, щоб він був у будь-якій, з якої запустиш гру
-                String logo = LanProxy.logoBase64();
-                for (Path d : allGameDirs()) {
-                    try { Nbt.addServer(d.resolve("servers.dat"), "Гра з друзями", tgt + ":" + port, logo); }
-                    catch (Exception ex) { log("servers.dat: " + ex.getMessage()); }
-                }
-                joinTarget = tgt + ":" + port;
-                pendingJoin = norm;
-                play();
-            });
-        }, "join-probe").start();
-    }
-
-    void startJoinMonitor(String code, String target) {
-        String[] hp = target.split(":");
-        String ip = hp[0];
-        int port = Integer.parseInt(hp[1]);
-        Thread t = new Thread(() -> {
-            int fails = 0;
-            while (code.equals(joinCode)) {
-                try { Thread.sleep(6000); } catch (InterruptedException e) { return; }
-                if (!code.equals(joinCode)) return;
-                fails = LanProxy.probe(ip, port) != 0 ? fails + 1 : 0;
-                if (fails >= 2) {
-                    joinCode = null;
-                    SwingUtilities.invokeLater(() -> {
-                        refreshFriendsCard();
-                        status.setText(I18n.t("Хост вийшов зі світу або вимкнув сесію — тебе від'єднано."));
-                    });
-                    return;
-                }
-            }
-        }, "join-monitor");
-        t.setDaemon(true);
-        t.start();
-    }
-
-    /** Від'єднатися: закриває гру, запущену для цієї сесії. */
-    void joinDisconnect() {
-        Process p = joinProc;
-        joinCode = null;
-        refreshFriendsCard();
-        if (p != null && p.isAlive()) p.destroy();
-        status.setText(I18n.t("Від'єднано від сесії."));
-    }
-
-    static javax.swing.event.DocumentListener simpleDoc(Runnable r) {
-        return new javax.swing.event.DocumentListener() {
-            @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { r.run(); }
-            @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { r.run(); }
-            @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { r.run(); }
+    // ---------- Швидкі дії ----------
+    JPanel quickActions() {
+        ListBtn[] bs = {
+            new ListBtn(I18n.t("Папка гри"), 5),
+            new ListBtn(I18n.t("Збірки"), 1),
+            new ListBtn(I18n.t("Галерея"), 6),
+            new ListBtn(I18n.t("Консоль"), 3),
+            new ListBtn(I18n.t("Налаштування"), 2)
         };
+        bs[0].addActionListener(e -> {
+            Object o = versions.getSelectedItem();
+            openFolder(o instanceof VItem && ((VItem) o).profile() != null ? instDir(((VItem) o).profile()) : gameDir());
+        });
+        bs[1].addActionListener(e -> showPage("mods"));
+        bs[2].addActionListener(e -> showPage("gallery"));
+        bs[3].addActionListener(e -> showPage("console"));
+        bs[4].addActionListener(e -> showPage("settings"));
+        JPanel p = new JPanel(new GridLayout(bs.length, 1, 0, 2));
+        p.setOpaque(false);
+        for (ListBtn b : bs) p.add(b);
+        return p;
     }
 
     /** Помітний блок на головній: тут можна створити свою збірку й відкрити бібліотеку збірок. */
@@ -5927,12 +5463,6 @@ final class LauncherWindow extends JFrame {
     }
 
     void play() {
-        final String jt = joinTarget;
-        joinTarget = null;
-        final String jc = pendingJoin;
-        pendingJoin = null;
-        final String hw = hostWorld;
-        final int hport = hostLanPort;
         Accounts.Acc acc = accounts.current();
         if (acc == null) { msg(I18n.t("Спочатку обери обліківку.")); showLogin(); return; }
         Object o = versions.getSelectedItem();
@@ -5944,8 +5474,7 @@ final class LauncherWindow extends JFrame {
         bar.set(0);
         engine.stop = false;
         cancelUi(true, cancelBtn, pauseBtn);
-        // хост бачить лаунчер (там код і стан сесії); гість ховає його за налаштуванням, як зазвичай
-        boolean hide = hideC.isSelected() && hw == null;
+        boolean hide = hideC.isSelected();
         Engine.Progress pg = (t, f) -> SwingUtilities.invokeLater(() -> { status.setText(t); bar.set(f); });
 
         final boolean[] started = {false}, ended = {false};
@@ -5959,43 +5488,11 @@ final class LauncherWindow extends JFrame {
                 pg.update(I18n.t("Перевірка обліківки…"), 0);
                 Accounts.Acc a = accounts.ensureFresh(acc, Accounts.LEGACY_CID);
                 List<String> cmd = engine.build(v, cfg, a, pg, gd);
-                if (hw != null && hport > 0 && lan != null) {
-                    String mcj = Json.string(v.get("_jar")) != null ? Json.string(v.get("_jar")) : it.id();
-                    try {
-                        Path ag = LanAgent.ensure(root);
-                        Path flag = flagPath();
-                        Files.createDirectories(flag.getParent());
-                        Files.deleteIfExists(flag);
-                        cmd = new ArrayList<>(cmd);
-                        Path cfgf = flag.resolveSibling("lan.cfg");
-                        Files.writeString(cfgf, hport + "\n" + gd.resolve("saves") + "\n" + hw + "\n" + flag + "\n"
-                                + (cfg.getb("allowOffline", false) ? "1" : "0") + "\n", java.nio.charset.StandardCharsets.UTF_8);
-                        cmd.add(1, "-javaagent:" + ag + "=" + cfgf);
-                        hostManualJoin = !Invite.modern(mcj);
-                        if (!hostManualJoin) { cmd.add("--quickPlaySingleplayer"); cmd.add(hw); }
-                        log(I18n.t("Світ «") + hw + I18n.t("» відкриється для друзів, щойно ти в нього зайдеш.")
-                                + (hostManualJoin ? I18n.t(" (ця версія не заходить у світ сама — обери його в «Одиночна гра»)") : ""));
-                    } catch (Throwable ex) {
-                        log(I18n.t("Авто-відкриття світу недоступне: ") + ex.getMessage());
-                    }
-                }
-                if (jt != null) {
-                    String mcj = Json.string(v.get("_jar")) != null ? Json.string(v.get("_jar")) : it.id();
-                    cmd = new ArrayList<>(cmd);
-                    cmd.addAll(Invite.joinArgs(mcj, jt));
-                    log(I18n.t("Автовхід на сервер друга: ") + jt);
-                }
                 firstLaunchLang(gd, Json.string(v.get("_jar")) != null ? Json.string(v.get("_jar")) : it.id());
                 String line = String.join(" ", cmd);
                 if (a.token().length() > 3) line = line.replace(a.token(), "***");
                 log(I18n.t("Запуск: ") + (line.length() > 500 ? line.substring(0, 500) + " …" : line));
                 Process pr = new ProcessBuilder(cmd).directory(gd.toFile()).redirectErrorStream(true).start();
-                if (jt != null && jc != null) {
-                    joinProc = pr;
-                    joinCode = jc;
-                    SwingUtilities.invokeLater(this::refreshFriendsCard);
-                    startJoinMonitor(jc, jt);
-                }
                 started[0] = true;
                 running.add(accKey(acc));
                 if (it.profile() == null) noteSession(it.id(), gd);
@@ -6011,30 +5508,9 @@ final class LauncherWindow extends JFrame {
                 if (hide) SwingUtilities.invokeLater(() -> { setVisible(false); trimMemory(); });
                 try (BufferedReader r = new BufferedReader(new InputStreamReader(pr.getInputStream(), StandardCharsets.UTF_8))) {
                     String ln;
-                    while ((ln = r.readLine()) != null) { log(ln); inviteHook(ln); }
+                    while ((ln = r.readLine()) != null) log(ln);
                 }
                 int code = pr.waitFor();
-                if (lan != null && jt == null) {
-                    // сесія живе, доки відкрита гра хоста: закрив Minecraft — сесія неактивна
-                    SwingUtilities.invokeLater(() -> {
-                        if (lan != null) {
-                            hostStop();
-                            status.setText(I18n.t("Сесію завершено: гру закрито"));
-                        }
-                    });
-                }
-                if (jt != null) {
-                    try {
-                        String[] hp = jt.split(":");
-                        if (LanProxy.probe(hp[0], Integer.parseInt(hp[1])) == 2)
-                            for (Path d : allGameDirs()) Nbt.removeServer(d.resolve("servers.dat"), "Гра з друзями");
-                    } catch (Exception ignored) { }
-                }
-                if (jt != null && joinProc == pr) {
-                    joinProc = null;
-                    joinCode = null;
-                    SwingUtilities.invokeLater(this::refreshFriendsCard);
-                }
                 log(I18n.t("Гра завершилась з кодом ") + code);
                 inGame = games.decrementAndGet() > 0;
                 running.remove(accKey(acc));
