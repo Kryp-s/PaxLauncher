@@ -56,6 +56,42 @@ final class FilePick {
         return fp.result();
     }
 
+    /** Системне вікно вибору файлу (Провідник), що відкривається в папці «Завантаження». */
+    static File nativeOpen(Component parent, String title, String winPattern, java.io.FilenameFilter filter) {
+        File dl = new File(System.getProperty("user.home", "."), "Downloads");
+        if (System.getProperty("os.name", "").toLowerCase().contains("win")) {
+            try {
+                String q = "'";
+                String script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+                        + "Add-Type -AssemblyName System.Windows.Forms;"
+                        + "$f=New-Object System.Windows.Forms.Form;$f.TopMost=$true;"
+                        + "$d=New-Object System.Windows.Forms.OpenFileDialog;"
+                        + "$d.Title=" + q + title.replace("'", "''") + q + ";"
+                        + (dl.isDirectory() ? "$d.InitialDirectory=" + q + dl.getAbsolutePath().replace("'", "''") + q + ";" : "")
+                        + "$d.Filter=" + q + "Images|" + (winPattern == null ? "*.*" : winPattern) + "|All files|*.*" + q + ";"
+                        + "if($d.ShowDialog($f) -eq 'OK'){[Console]::Out.Write($d.FileName)}";
+                String enc = java.util.Base64.getEncoder().encodeToString(script.getBytes(java.nio.charset.StandardCharsets.UTF_16LE));
+                String root = System.getenv("SystemRoot");
+                String ps = root != null && new File(root, "System32\\WindowsPowerShell\\v1.0\\powershell.exe").isFile()
+                        ? new File(root, "System32\\WindowsPowerShell\\v1.0\\powershell.exe").getPath() : "powershell.exe";
+                Process pr = new ProcessBuilder(ps, "-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", enc)
+                        .redirectError(ProcessBuilder.Redirect.DISCARD).start();
+                String out = new String(pr.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).trim();
+                if (pr.waitFor() == 0) return out.isEmpty() ? null : new File(out);
+            } catch (Exception ignored) { }
+        }
+        Window w = parent instanceof Window ? (Window) parent : parent == null ? null : SwingUtilities.getWindowAncestor(parent);
+        FileDialog fd = w instanceof Dialog ? new FileDialog((Dialog) w, title, FileDialog.LOAD)
+                : new FileDialog(w instanceof Frame ? (Frame) w : null, title, FileDialog.LOAD);
+        if (dl.isDirectory()) fd.setDirectory(dl.getAbsolutePath());
+        if (winPattern != null && System.getProperty("os.name", "").toLowerCase().contains("win")) fd.setFile(winPattern);
+        if (filter != null) fd.setFilenameFilter(filter);
+        fd.setMultipleMode(false);
+        fd.setVisible(true);
+        String n = fd.getFile();
+        return n == null ? null : new File(fd.getDirectory(), n);
+    }
+
     private static Icon icon(boolean folder) {
         return new Icon() {
             @Override public int getIconWidth() { return 20; }

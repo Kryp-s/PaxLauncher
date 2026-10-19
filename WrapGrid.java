@@ -60,7 +60,12 @@ final class WrapGrid implements LayoutManager {
 
     @Override public void layoutContainer(Container t) {
         int n = t.getComponentCount(), c = cols(t);
-        for (int i = 0; i < n; i++) t.getComponent(i).setBounds((i % c) * (cw() + gap()), (i / c) * (ch() + gap()), cw(), ch());
+        int tw = t.getWidth();
+        Container vp = SwingUtilities.getAncestorOfClass(JViewport.class, t);
+        if (vp != null && vp.getWidth() > 0) tw = vp.getWidth();
+        // зайве місце по ширині розподіляємо між колонками, щоб праворуч не лишалось порожнечі
+        int cwe = Math.max(cw(), (tw - (c - 1) * gap()) / c);
+        for (int i = 0; i < n; i++) t.getComponent(i).setBounds((i % c) * (cwe + gap()), (i / c) * (ch() + gap()), cwe, ch());
         int rows = (n + c - 1) / c;
         if (rows != lastRows) {
             lastRows = rows;

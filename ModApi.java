@@ -39,7 +39,9 @@ final class ModApi {
         SHADER("shader", "shaderpacks", I18n.t("Шейдери"), I18n.t("Пошук шейдерів"), I18n.t("Встановлені шейдери"), I18n.t("Папка шейдерів"),
                 I18n.t("Сторінка шейдера"), I18n.t("Видалити шейдер"), I18n.t("Версія шейдера (для цієї збірки)"), 6552, "shaders"),
         WORLD("world", "saves", I18n.t("Мапи"), I18n.t("Пошук мап"), I18n.t("Встановлені мапи"), I18n.t("Папка мап"),
-                I18n.t("Сторінка мапи"), I18n.t("Видалити мапу"), I18n.t("Версія мапи (для цієї збірки)"), 17, "worlds");
+                I18n.t("Сторінка мапи"), I18n.t("Видалити мапу"), I18n.t("Версія мапи (для цієї збірки)"), 17, "worlds"),
+        MODPACK("modpack", "", I18n.t("Збірки модів"), I18n.t("Пошук збірок модів"), I18n.t("Встановлені збірки"), I18n.t("Папка збірки"),
+                I18n.t("Сторінка збірки"), I18n.t("Видалити збірку"), I18n.t("Версія збірки"), 4471, "modpacks");
 
         final String type, folder, title, searchTitle, installedTitle, folderBtn, pageBtn, removeBtn, versionLabel, cfPath;
         final int cfClass;
@@ -56,11 +58,14 @@ final class ModApi {
 
         boolean isWorld() { return this == WORLD; }
 
+        /** Модові збірки (modpack): ставляться у вже існуючу збірку (профіль), яку вибрано зверху. */
+        boolean isPack() { return this == MODPACK; }
+
         /** Мапи на Modrinth відсутні — їх беруть лише з CurseForge. */
         boolean onModrinth() { return this != WORLD; }
 
         /** Що можна «переносити» (імпортувати) зі старих збірок: моди (.jar), набори ресурсів і шейдери (.zip). */
-        boolean importable() { return this != WORLD; }
+        boolean importable() { return this != WORLD && this != MODPACK; }
 
         boolean matches(String fileName) {
             String n = fileName.toLowerCase(Locale.ROOT);
@@ -145,7 +150,12 @@ final class ModApi {
         return t;
     }
 
-    record ModFile(String name, String filename, String url, String sha1, String channel, String date, List<String> deps) {
+    /** mcs / loaders — версії гри та завантажувачі, для яких зроблено файл (заповнюється для модових збірок). */
+    record ModFile(String name, String filename, String url, String sha1, String channel, String date, List<String> deps,
+                   List<String> mcs, List<String> loaders) {
+        ModFile(String name, String filename, String url, String sha1, String channel, String date, List<String> deps) {
+            this(name, filename, url, sha1, channel, date, deps, List.of(), List.of());
+        }
         @Override public String toString() {
             return name + "  · " + channel + (date.isEmpty() ? "" : "  · " + date) + (url == null ? I18n.t("  · тільки з сайту") : "");
         }
@@ -228,7 +238,7 @@ final class ModApi {
                 HttpRequest rq = HttpRequest.newBuilder(URI.create(MR + "/version_files"))
                         .header("User-Agent", "PaxLauncher/1.0").header("Content-Type", "application/json")
                         .timeout(Duration.ofSeconds(30)).POST(HttpRequest.BodyPublishers.ofString(body)).build();
-                HttpResponse<String> r = eng.http.send(rq, HttpResponse.BodyHandlers.ofString());
+                HttpResponse<String> r = eng.sendRetry(rq, HttpResponse.BodyHandlers.ofString());
                 if (r.statusCode() != 200) continue;
                 Map<String, Object> res = m(Json.parse(r.body()));
                 if (res == null) continue;
@@ -306,6 +316,14 @@ final class ModApi {
                 }
             }
             cand.add("pack.png");
+            if (kind.isMod()) {
+                cand.add("icon.png");
+                cand.add("logo.png");
+                for (java.util.Enumeration<? extends java.util.zip.ZipEntry> en = z.entries(); en.hasMoreElements(); ) {
+                    String n = en.nextElement().getName();
+                    if (n.matches("assets/[^/]+/(icon|logo)\\.png")) { cand.add(n); break; }
+                }
+            }
             for (String c : cand) {
                 String name = c.startsWith("/") ? c.substring(1) : c;
                 java.util.zip.ZipEntry e = z.getEntry(name);
@@ -341,7 +359,14 @@ final class ModApi {
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
                 .header("User-Agent", "PaxLauncher/1.0").header("Accept", "application/json")
                 .timeout(Duration.ofSeconds(30));
-        HttpResponse<String> r = eng.http.send(b.build(), HttpResponse.BodyHandlers.ofString());
+        HttpRequest rq = b.build();
+        HttpResponse<String> r = eng.sendRetry(rq, HttpResponse.BodyHandlers.ofString());
+        if (r.statusCode() == 429) {   // Modrinth обмежує частоту запитів — чекаємо трохи й пробуємо ще раз
+            long wait = 1500;
+            try { wait = Math.min(5000, Long.parseLong(r.headers().firstValue("Retry-After").orElse("1")) * 1000); } catch (Exception ignored) { }
+            Thread.sleep(wait);
+            r = eng.sendRetry(rq, HttpResponse.BodyHandlers.ofString());
+        }
         if (r.statusCode() != 200) throw new IOException("HTTP " + r.statusCode());
         return r.body();
     }
@@ -652,7 +677,7 @@ final class ModApi {
 
     private List<Hit> searchNet(Source src, Kind kind, String q, String mc, String loader, int offset) throws Exception {
         if (src == Source.CURSEFORGE) return cf.search(kind, q, mc, loader, offset);
-        StringBuilder f = new StringBuilder("[[\"project_type:" + kind.type + "\"],[\"versions:" + mc + "\"]");
+        StringBuilder f = new StringBuilder("[[\"project_type:" + kind.type + "\"]" + (kind.isPack() ? "" : ",[\"versions:" + mc + "\"]"));
         if (kind.isMod()) {
             List<String> cats = modrinthLoaders(loader);
             if (!cats.isEmpty())
@@ -681,7 +706,7 @@ final class ModApi {
 
     List<ModFile> files(Kind kind, String id, String mc, String loader) throws Exception {
         if (CurseForge.isCf(id)) return cf.files(kind, id, mc, loader);
-        String url = MR + "/project/" + id + "/version?game_versions=" + enc("[\"" + mc + "\"]");
+        String url = MR + "/project/" + id + "/version" + (kind.isPack() ? "" : "?game_versions=" + enc("[\"" + mc + "\"]"));
         if (kind.isMod()) {
             List<String> cats = modrinthLoaders(loader);
             if (!cats.isEmpty()) url += "&loaders=" + enc(jsonArr(cats));
@@ -693,6 +718,15 @@ final class ModApi {
             if (fl.isEmpty()) continue;
             Map<String, Object> file = m(fl.get(0));
             for (Object fo : fl) if (Boolean.TRUE.equals(m(fo).get("primary"))) { file = m(fo); break; }
+            if (kind.isPack()) {
+                Map<String, Object> mr = null;
+                for (Object fo : fl) {
+                    Map<String, Object> x = m(fo);
+                    if (x != null && str(x.get("filename")).toLowerCase(Locale.ROOT).endsWith(".mrpack") && (mr == null || Boolean.TRUE.equals(x.get("primary")))) mr = x;
+                }
+                if (mr == null) continue;
+                file = mr;
+            }
             String channel = str(v.get("version_type"));
             String date = str(v.get("date_published"));
             List<String> deps = new ArrayList<>();
@@ -701,11 +735,32 @@ final class ModApi {
                 if ("required".equals(s(dm.get("dependency_type"))) && s(dm.get("project_id")) != null)
                     deps.add(s(dm.get("project_id")));
             }
-            out.add(new ModFile(str(v.get("version_number")), str(file.get("filename")), s(file.get("url")),
+            List<String> mcs = new ArrayList<>(), lds = new ArrayList<>();
+            if (kind.isPack()) {
+                for (Object g : l(v.get("game_versions"))) if (!str(g).isEmpty()) mcs.add(str(g));
+                for (Object g : l(v.get("loaders"))) if (!str(g).isEmpty()) lds.add(str(g).toLowerCase(Locale.ROOT));
+            }
+            out.add(new ModFile(packName(kind, v), str(file.get("filename")), s(file.get("url")),
                     bestHash(m(file.get("hashes"))),
-                    channel.isEmpty() ? "release" : channel, date.length() >= 10 ? date.substring(0, 10) : "", deps));
+                    channel.isEmpty() ? "release" : channel, date.length() >= 10 ? date.substring(0, 10) : "", deps, mcs, lds));
         }
         return out;
+    }
+
+    /** Для модпаків у назві версії показуємо ще й версію гри та завантажувач. */
+    private static String packName(Kind kind, Map<String, Object> v) {
+        String name = str(v.get("version_number"));
+        if (!kind.isPack()) return name;
+        List<Object> gv = l(v.get("game_versions"));
+        String mcv = gv.isEmpty() ? "" : str(gv.get(gv.size() - 1));
+        StringBuilder ld = new StringBuilder();
+        for (Object g : l(v.get("loaders"))) {
+            String x = str(g);
+            if (x.isEmpty()) continue;
+            if (ld.length() > 0) ld.append('/');
+            ld.append(Character.toUpperCase(x.charAt(0))).append(x.substring(1));
+        }
+        return name + (mcv.isEmpty() && ld.length() == 0 ? "" : "  · " + mcv + (ld.length() > 0 ? " " + ld : ""));
     }
 
     private static String bestHash(Map<String, Object> h) {
@@ -809,14 +864,14 @@ final class ModApi {
         }
     }
 
-    private static Properties loadReg(Path dir) {
+    static Properties loadReg(Path dir) {
         Properties p = new Properties();
         Path f = dir.resolve(".pax-mods.properties");
         if (Files.exists(f)) try (Reader r = Files.newBufferedReader(f, StandardCharsets.UTF_8)) { p.load(r); } catch (IOException ignored) { }
         return p;
     }
 
-    private static void saveReg(Path dir, Properties p) {
+    static void saveReg(Path dir, Properties p) {
         try (Writer w = Files.newBufferedWriter(dir.resolve(".pax-mods.properties"), StandardCharsets.UTF_8)) { p.store(w, "PaxLauncher mods"); }
         catch (IOException ignored) { }
     }

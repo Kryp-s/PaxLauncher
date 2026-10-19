@@ -42,7 +42,14 @@ final class LauncherWindow extends JFrame {
 
     final Path root = PaxLauncher.ROOT;
     final Settings cfg = new Settings(root.resolve("launcher.properties"));
-    final JTextArea console = new JTextArea();
+    final JTextPane console = new JTextPane();
+    enum Lvl { ERROR, WARN, INFO, DEBUG }
+    record LogEnt(Lvl lvl, String text) { }
+    final List<LogEnt> logAll = new ArrayList<>();
+    final EnumMap<Lvl, Check> lvlChecks = new EnumMap<>(Lvl.class);
+    final Field conQ = new Field("");
+    Lvl lastLvl = Lvl.INFO;
+    static final int LOG_MAX = 6000;
     final Engine engine = new Engine(root, this::log);
     final ModApi api = new ModApi(engine);
 
@@ -59,11 +66,13 @@ final class LauncherWindow extends JFrame {
     final Set<String> running = ConcurrentHashMap.newKeySet();
 
     static String accKey(Accounts.Acc a) { return a.type() + ":" + a.name() + ":" + a.uuid(); }
-    final Btn loadersBtn = new Btn(I18n.t("Додати версію"), Btn.Kind.SECONDARY);
+    final Btn loadersBtn = new Btn(I18n.t("Створити збірку"), Btn.Kind.SECONDARY);
     boolean filling;
     volatile boolean busy;
 
     final Combo<String> lMc = new Combo<>(), lType = new Combo<>();
+    final Check lSnaps = new Check(I18n.t("Показати знімки та давні версії"), false);
+    final JLabel lvLbl = label(I18n.t("Версія завантажувача"), 13, true, Theme.MUTED);
     final Combo<Engine.LV> lVer = new Combo<>();
     final Btn lInstall = new Btn(I18n.t("Встановити"), Btn.Kind.PRIMARY);
     final JLabel lStatus = label(I18n.t("Обери версію Minecraft і завантажувач"), 13, false, Theme.MUTED);
@@ -115,6 +124,230 @@ final class LauncherWindow extends JFrame {
     final JPanel mInfoWrap = new JPanel();
     Btn mImpB, mImpPackB;
     JPanel mTop;
+    JPanel manageHead, mRow1, mRow2, mR1b, mR2b, mhActions, mhSearch;
+    final JLabel mhName = label(" ", 18, true, Theme.TEXT);
+    final JLabel mhSub = label(" ", 12, false, Theme.MUTED);
+    BufferedImage mhImg;
+    final List<KindPill> kindPills = new ArrayList<>();
+
+    /** Перемикач категорії у вигляді «пілюль» для режиму керування збіркою. */
+    static final class KindPill extends JComponent {
+        final ModApi.Kind kind;
+        final String text;
+        boolean sel, hov;
+        KindPill(String text, Runnable click) { this(null, text, click); }
+        KindPill(ModApi.Kind k, Runnable click) { this(k, k.title, click); }
+        private KindPill(ModApi.Kind k, String text, Runnable click) {
+            this.kind = k;
+            this.text = text;
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            Font f = Theme.bfont(Font.BOLD, 12);
+            setFont(f);
+            int w = getFontMetrics(f).stringWidth(text) + Theme.px(26);
+            setPreferredSize(new Dimension(w, Theme.px(30)));
+            addMouseListener(new MouseAdapter() {
+                @Override public void mouseEntered(MouseEvent e) { hov = true; repaint(); }
+                @Override public void mouseExited(MouseEvent e) { hov = false; repaint(); }
+                @Override public void mouseClicked(MouseEvent e) { click.run(); }
+            });
+        }
+        @Override protected void paintComponent(Graphics g0) {
+            Graphics2D g = (Graphics2D) g0.create();
+            Theme.aa(g);
+            int w = getWidth(), h = getHeight();
+            g.setColor(sel ? Theme.ACC2 : hov ? Theme.CARD_HOV : Theme.INPUT);
+            g.fillRoundRect(0, 0, w, h, h, h);
+            g.setFont(getFont());
+            g.setColor(sel ? Theme.ACC_ON : hov ? Theme.TEXT : Theme.MUTED);
+            FontMetrics fm = g.getFontMetrics();
+            g.drawString(text, (w - fm.stringWidth(text)) / 2, (h - fm.getHeight()) / 2 + fm.getAscent());
+            g.dispose();
+        }
+    }
+
+    void syncPills() {
+        Object cur = mKind.getSelectedItem();
+        for (KindPill p : kindPills) { p.sel = p.kind == cur; p.repaint(); }
+    }
+
+    /** Повзунок ОЗП для збірки. Без власного значення показує загальне з налаштувань. */
+    final class RamPick extends JPanel {
+        final JSlider sl = new JSlider(2, 32, 8);
+        final JLabel lbl = label(" ", 12, false, Theme.MUTED);
+        boolean quiet;
+        RamPick(Runnable onChange) {
+            super(new BorderLayout(12, 0));
+            setOpaque(false);
+            sl.setOpaque(false);
+            sl.setUI(new SlimSliderUI(sl));
+            sl.setMaximum((int) Math.max(4, Math.min(64, totalMemMb() / 512)));
+            lbl.setPreferredSize(new Dimension(Theme.px(90), 24));
+            add(sl, BorderLayout.CENTER);
+            add(lbl, BorderLayout.EAST);
+            sl.addChangeListener(e -> {
+                lbl.setText(sl.getValue() * 512 + " MB");
+                if (!quiet && !sl.getValueIsAdjusting() && onChange != null) onChange.run();
+            });
+        }
+        int globalMb() {
+            int def = (int) Math.max(1024, Math.min(4096, totalMemMb() / 2));
+            return cfg.geti("ram", def);
+        }
+        /** mb < 512 — значення не задано, береться загальне з налаштувань. */
+        void setValueMb(int mb) {
+            quiet = true;
+            int v = mb >= 512 ? mb : globalMb();
+            sl.setValue(Math.max(sl.getMinimum(), Math.min(sl.getMaximum(), v / 512)));
+            lbl.setText(sl.getValue() * 512 + " MB");
+            quiet = false;
+        }
+        int valueMb() { return sl.getValue() * 512; }
+    }
+
+    RamPick mhRam;
+    boolean mhRamLoading;
+
+    int profileRam(String name) {
+        try (Reader rd = Files.newBufferedReader(instDir(name).resolve("profile.properties"), StandardCharsets.UTF_8)) {
+            Properties pr = new Properties();
+            pr.load(rd);
+            return Integer.parseInt(pr.getProperty("ram", "0").trim());
+        } catch (Exception e) { return 0; }
+    }
+
+    void saveProfileRam(String name, int mb) {
+        Path pf = instDir(name).resolve("profile.properties");
+        try {
+            Properties pr = new Properties();
+            if (Files.isRegularFile(pf)) try (Reader rd = Files.newBufferedReader(pf, StandardCharsets.UTF_8)) { pr.load(rd); }
+            if (mb >= 512) pr.setProperty("ram", String.valueOf(mb)); else pr.remove("ram");
+            try (Writer w = Files.newBufferedWriter(pf, StandardCharsets.UTF_8)) { pr.store(w, "PaxLauncher profile"); }
+        } catch (IOException ex) { log(I18n.t("Не вдалося зберегти налаштування збірки: ") + ex.getMessage()); }
+    }
+
+    void updateManageHead() {
+        Prof p = curProf();
+        if (p == null) return;
+        mhName.setText(p.name());
+        mhSub.setText(p.loader() + "  ·  Minecraft " + p.mc());
+        if (mhRam != null) { mhRamLoading = true; mhRam.setValueMb(profileRam(p.name())); mhRamLoading = false; }
+        mhImg = BuildIcons.load(instDir(p.name()), Theme.px(48) * 2);
+        if (manageHead != null) manageHead.repaint();
+    }
+
+    JPanel buildManageHead() {
+        JComponent ic = new JComponent() {
+            { setPreferredSize(new Dimension(Theme.px(48), Theme.px(48))); }
+            @Override protected void paintComponent(Graphics g0) {
+                Graphics2D g = (Graphics2D) g0.create();
+                Theme.aa(g);
+                g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+                int s = Math.min(getWidth(), getHeight());
+                if (mhImg != null) g.drawImage(mhImg, 0, 0, s, s, null);
+                g.dispose();
+            }
+        };
+        JPanel names = new JPanel();
+        names.setOpaque(false);
+        names.setLayout(new BoxLayout(names, BoxLayout.Y_AXIS));
+        mhName.setAlignmentX(Component.LEFT_ALIGNMENT);
+        mhSub.setAlignmentX(Component.LEFT_ALIGNMENT);
+        names.add(Box.createVerticalGlue());
+        names.add(mhName);
+        names.add(Box.createVerticalStrut(2));
+        names.add(mhSub);
+        names.add(Box.createVerticalGlue());
+        JPanel id = new JPanel(new BorderLayout(12, 0));
+        id.setOpaque(false);
+        id.add(ic, BorderLayout.WEST);
+        id.add(names, BorderLayout.CENTER);
+
+        mhActions = new JPanel();
+        mhActions.setOpaque(false);
+        mhActions.setLayout(new BoxLayout(mhActions, BoxLayout.X_AXIS));
+        JPanel actW = new JPanel(new GridBagLayout());
+        actW.setOpaque(false);
+        actW.add(mhActions);
+
+        JPanel top = new JPanel(new BorderLayout(12, 0));
+        top.setOpaque(false);
+        top.add(id, BorderLayout.WEST);
+        top.add(actW, BorderLayout.EAST);
+
+        JPanel pills = new JPanel();
+        pills.setOpaque(false);
+        pills.setLayout(new BoxLayout(pills, BoxLayout.X_AXIS));
+        for (ModApi.Kind k : new ModApi.Kind[]{ModApi.Kind.MOD, ModApi.Kind.PACK, ModApi.Kind.SHADER, ModApi.Kind.WORLD, ModApi.Kind.MODPACK}) {
+            KindPill kp = new KindPill(k, () -> mKind.setSelectedItem(k));
+            kindPills.add(kp);
+            if (pills.getComponentCount() > 0) pills.add(Box.createHorizontalStrut(6));
+            pills.add(kp);
+        }
+        JPanel pillsW = new JPanel(new GridBagLayout());
+        pillsW.setOpaque(false);
+        pillsW.add(pills);
+
+        mhSearch = new JPanel(new BorderLayout());
+        mhSearch.setOpaque(false);
+        mhSearch.setPreferredSize(new Dimension(Theme.px(280), Theme.px(38)));
+        JPanel bar = new JPanel(new BorderLayout(12, 0));
+        bar.setOpaque(false);
+        bar.add(pillsW, BorderLayout.WEST);
+        bar.add(mhSearch, BorderLayout.EAST);
+
+        JPanel wrap = new JPanel(new BorderLayout(0, 12));
+        wrap.setOpaque(false);
+        wrap.setBorder(new EmptyBorder(0, 0, 4, 0));
+        wrap.add(top, BorderLayout.NORTH);
+        wrap.add(bar, BorderLayout.CENTER);
+        mhRam = new RamPick(() -> {
+            Prof cp = curProf();
+            if (cp != null && !mhRamLoading) saveProfileRam(cp.name(), mhRam.valueMb());
+        });
+        JLabel ramT = label(I18n.t("Виділена пам'ять (ОЗП)"), 12, true, Theme.MUTED);
+        JLabel ramH = label(I18n.t("Діє з наступного запуску гри."), 11, false, Theme.MUTED);
+        JPanel ramBox = new JPanel(new BorderLayout(12, 0));
+        ramBox.setOpaque(false);
+        ramBox.setBorder(new EmptyBorder(4, 0, 0, 0));
+        JPanel ramL = new JPanel();
+        ramL.setOpaque(false);
+        ramL.setLayout(new BoxLayout(ramL, BoxLayout.Y_AXIS));
+        ramT.setAlignmentX(Component.LEFT_ALIGNMENT);
+        ramH.setAlignmentX(Component.LEFT_ALIGNMENT);
+        ramL.add(ramT);
+        ramL.add(ramH);
+        ramL.setPreferredSize(new Dimension(Theme.px(190), ramL.getPreferredSize().height));
+        ramBox.add(ramL, BorderLayout.WEST);
+        ramBox.add(mhRam, BorderLayout.CENTER);
+        wrap.add(ramBox, BorderLayout.SOUTH);
+        wrap.setVisible(false);
+        wrap.setAlignmentX(Component.LEFT_ALIGNMENT);
+        return wrap;
+    }
+
+    /** У режимі керування кнопки «Імпортувати файли / Назад» і пошук живуть у шапці збірки; поза ним — у звичайних рядках. */
+    void placeManageControls(boolean manage) {
+        if (mhActions == null || mR1b == null) return;
+        if (manage) {
+            mhActions.removeAll();
+            mhActions.add(mImpB);
+            mhActions.add(Box.createHorizontalStrut(8));
+            mhActions.add(mManage);
+            mhSearch.removeAll();
+            mhSearch.add(mQuery, BorderLayout.CENTER);
+        } else {
+            mR1b.removeAll();
+            mR1b.add(mImpB);
+            mR1b.add(Box.createHorizontalStrut(8));
+            mR1b.add(mManage);
+            mR1b.add(Box.createHorizontalGlue());
+            mRow2.add(mQuery, BorderLayout.CENTER);
+        }
+        mhActions.revalidate(); mhSearch.revalidate(); mR1b.revalidate(); mRow2.revalidate();
+    }
+    Btn lOk;
+    JPanel loadersBox;
+    Card mCard;
     final JLabel dIcon = new JLabel();
     JPanel dIconWrap;
     final JPanel dChips = chipRow();
@@ -190,7 +423,7 @@ final class LauncherWindow extends JFrame {
             if (mInfoWrap.getParent() != null) { mInfoWrap.getParent().revalidate(); mInfoWrap.getParent().repaint(); }
         }
     }
-    final JLabel mStatus = label(I18n.t("Створи збірку і шукай моди"), 13, false, Theme.MUTED);
+    final JLabel mStatus = label(" ", 13, false, Theme.MUTED);
     final Bar mBar = new Bar();
     final DefaultListModel<ModApi.Hit> mModel = new DefaultListModel<>();
     volatile boolean mLoading;
@@ -236,18 +469,22 @@ final class LauncherWindow extends JFrame {
     final JTextArea dDesc = new JTextArea();
     final Combo<ModApi.ModFile> mFiles = new Combo<>();
     final Btn mInstall = new Btn(I18n.t("Встановити"), Btn.Kind.PRIMARY);
+    final Btn mManage = new Btn(I18n.t("Керувати збіркою"), Btn.Kind.SECONDARY);
+    final Btn mRootB = new Btn(I18n.t("Коренева папка"), Btn.Kind.SECONDARY);
+    boolean packInstalledNow;
     final Btn mCancel = new Btn(I18n.t("Зупинити"), Btn.Kind.DANGER);
     volatile boolean mCancelled;
     final Btn mSearch = new Btn(I18n.t("Знайти"), Btn.Kind.PRIMARY);
     final Btn mMore = new Btn(I18n.t("Ще результати"), Btn.Kind.SECONDARY);
     final Btn mPage = new Btn(I18n.t("Сторінка мода"), Btn.Kind.SECONDARY);
     final DefaultListModel<String> iModel = new DefaultListModel<>();
-    final JList<String> iList = new JList<>(iModel);
+    final JList<String> iList = emptyAware(iModel);
     final CardLayout mCards = new CardLayout();
     final JPanel mCenter = new JPanel(mCards);
     JScrollPane playScroll;
 
     static final String DISCORD_URL = "https://discord.gg/WeP5n53z8e";
+    static final String SITE_URL = "https://paxlauncher.pp.ua";
     static final String SUPPORT_URL = "https://send.monobank.ua/jar/A8UDDsJojo";
     final Btn mToggleView = new Btn(I18n.t("Встановлені моди"), Btn.Kind.SECONDARY);
     JPanel dFoot;
@@ -260,6 +497,7 @@ final class LauncherWindow extends JFrame {
         if (mcv == null || loader == null || !srcChosen()) return;
         final ModApi.Source src = srcNow();
         for (ModApi.Kind k : ModApi.Kind.values()) {
+            if (k.isPack()) continue;
             if (k.isMod() && loader.equals("Vanilla")) continue;
             if (src == ModApi.Source.MODRINTH && !k.onModrinth()) continue;
             Thread t = new Thread(() -> {
@@ -340,10 +578,11 @@ final class LauncherWindow extends JFrame {
         right.setOpaque(false);
         pages.setOpaque(false);
         addPage("play", playPage());
-        addPage("loaders", loadersPage());
+        loadersBox = loadersPage();
         addPage("console", consolePage());
         addPage("gallery", galleryPage());
         addPage("mods", modsPage());
+        addPage("library", libraryPage());
         addPage("settings", settingsPage());
         right.add(pages, BorderLayout.CENTER);
         app.add(right, BorderLayout.CENTER);
@@ -376,6 +615,27 @@ final class LauncherWindow extends JFrame {
         pre.start();
     }
 
+    /** Список, який у порожньому стані малює по центру «Нічого не встановлено». */
+    static <T> JList<T> emptyAware(ListModel<T> m) {
+        return new JList<T>(m) {
+            @Override protected void paintComponent(Graphics g0) {
+                super.paintComponent(g0);
+                if (getModel().getSize() > 0) return;
+                Graphics2D g = (Graphics2D) g0.create();
+                Theme.aa(g);
+                Container v = getParent();
+                int w = v instanceof JViewport ? v.getWidth() : getWidth();
+                int h = v instanceof JViewport ? v.getHeight() : getHeight();
+                String t = I18n.t("Нічого не встановлено");
+                g.setFont(Theme.font(Font.BOLD, 16));
+                g.setColor(Theme.MUTED);
+                FontMetrics fm = g.getFontMetrics();
+                g.drawString(t, (w - fm.stringWidth(t)) / 2, (h - fm.getHeight()) / 2 + fm.getAscent());
+                g.dispose();
+            }
+        };
+    }
+
     static JLabel label(String text, int size, boolean bold, Color c) {
         JLabel l = new JLabel(text);
         l.setFont(Theme.font(bold ? Font.BOLD : Font.PLAIN, size));
@@ -396,18 +656,120 @@ final class LauncherWindow extends JFrame {
         if (logPending.compareAndSet(false, true)) SwingUtilities.invokeLater(this::flushLog);
     }
 
+    static final java.util.regex.Pattern LVL_TAG = java.util.regex.Pattern.compile("[/ \\[](FATAL|ERROR|WARN|WARNING|INFO|DEBUG|TRACE)\\]");
+
+    /** Визначає рівень запису: за позначкою Minecraft/Log4j, за стеком помилки, за словами лаунчера. */
+    Lvl detectLvl(String s) {
+        java.util.regex.Matcher m = LVL_TAG.matcher(s.length() > 200 ? s.substring(0, 200) : s);
+        if (m.find()) {
+            switch (m.group(1)) {
+                case "FATAL": case "ERROR": return Lvl.ERROR;
+                case "WARN": case "WARNING": return Lvl.WARN;
+                case "DEBUG": case "TRACE": return Lvl.DEBUG;
+                default: return Lvl.INFO;
+            }
+        }
+        String t = s.stripLeading();
+        if (!s.isEmpty() && (Character.isWhitespace(s.charAt(0)) || t.startsWith("at ") || t.startsWith("Caused by") || t.startsWith("..."))
+                && lastLvl == Lvl.ERROR) return Lvl.ERROR;
+        if (s.startsWith("Exception ") || t.matches("^[\\w.$]+(Exception|Error)(:.*)?$") || t.startsWith("Caused by")) return Lvl.ERROR;
+        String l = s.toLowerCase(Locale.ROOT);
+        if (l.contains("помилка") || l.contains("не вдалося") || l.contains(" failed") || l.startsWith("error")) return Lvl.ERROR;
+        if (l.startsWith("увага") || l.startsWith("warning") || l.contains("потрібно завантажити вручну")) return Lvl.WARN;
+        return Lvl.INFO;
+    }
+
+    Color lvlColor(Lvl l) {
+        boolean lt = Theme.light;
+        switch (l) {
+            case ERROR: return lt ? new Color(0xC62828) : new Color(0xFF6B6B);
+            case WARN: return lt ? new Color(0x9A6700) : new Color(0xE9B949);
+            case DEBUG: return Theme.MUTED;
+            default: return Theme.CONSOLE_FG;
+        }
+    }
+
+    String lvlName(Lvl l) {
+        switch (l) {
+            case ERROR: return I18n.t("Помилки");
+            case WARN: return I18n.t("Попередження");
+            case DEBUG: return I18n.t("Debug");
+            default: return I18n.t("Інфо");
+        }
+    }
+
+    boolean lvlShown(LogEnt e, String q) {
+        Check c = lvlChecks.get(e.lvl());
+        if (c != null && !c.isSelected()) return false;
+        return q.isEmpty() || e.text().toLowerCase(Locale.ROOT).contains(q);
+    }
+
+    void appendLog(LogEnt e) {
+        javax.swing.text.StyledDocument d = console.getStyledDocument();
+        javax.swing.text.SimpleAttributeSet a = new javax.swing.text.SimpleAttributeSet();
+        javax.swing.text.StyleConstants.setForeground(a, lvlColor(e.lvl()));
+        javax.swing.text.StyleConstants.setBold(a, e.lvl() == Lvl.ERROR);
+        try { d.insertString(d.getLength(), e.text() + "\n", a); } catch (Exception ignored) { }
+    }
+
+    /** Перемальовує консоль за поточними фільтрами (рівні + пошук). */
+    void rebuildConsole() {
+        String q = conQ.getText().trim().toLowerCase(Locale.ROOT);
+        console.setText("");
+        StringBuilder none = new StringBuilder();
+        for (LogEnt e : logAll) if (lvlShown(e, q)) appendLog(e);
+        console.setCaretPosition(console.getDocument().getLength());
+        updateLvlCounts();
+    }
+
+    void updateLvlCounts() {
+        int[] n = new int[Lvl.values().length];
+        for (LogEnt e : logAll) n[e.lvl().ordinal()]++;
+        for (Lvl l : Lvl.values()) {
+            Check c = lvlChecks.get(l);
+            if (c != null) c.setText(lvlName(l) + " " + n[l.ordinal()]);
+        }
+    }
+
+    void clearConsole() {
+        logAll.clear();
+        lastLvl = Lvl.INFO;
+        console.setText("");
+        updateLvlCounts();
+    }
+
+    /** Повертає весь журнал у вигляді тексту (для перенесення при зміні мови). */
+    void loadLog(List<LogEnt> src) {
+        logAll.clear();
+        logAll.addAll(src);
+        rebuildConsole();
+    }
+
     private void flushLog() {
         logPending.set(false);
-        StringBuilder sb = new StringBuilder();
         String ln;
-        while ((ln = logQ.poll()) != null) sb.append(ln).append('\n');
-        if (sb.length() == 0) return;
-        console.append(sb.toString());
-        javax.swing.text.Document d = console.getDocument();
-        if (d.getLength() > 120_000) {
-            try { d.remove(0, d.getLength() - 80_000); } catch (Exception ignored) { }
+        boolean any = false, trimmed = false;
+        String q = conQ.getText().trim().toLowerCase(Locale.ROOT);
+        while ((ln = logQ.poll()) != null) {
+            for (String part : ln.split("\\R", -1)) {
+                Lvl lv = detectLvl(part);
+                lastLvl = lv;
+                LogEnt e = new LogEnt(lv, part);
+                logAll.add(e);
+                any = true;
+                if (lvlShown(e, q)) appendLog(e);
+            }
         }
-        console.setCaretPosition(d.getLength());
+        if (!any) return;
+        if (logAll.size() > LOG_MAX) {
+            logAll.subList(0, logAll.size() - (LOG_MAX - 1000)).clear();
+            trimmed = true;
+        }
+        if (trimmed) rebuildConsole();
+        else {
+            updateLvlCounts();
+            console.setCaretPosition(console.getDocument().getLength());
+        }
     }
 
     void trimMemory() {
@@ -725,6 +1087,7 @@ final class LauncherWindow extends JFrame {
             case "mods": d = I18n.t("У вкладці «Моди»"); st = I18n.t("Шукає й встановлює моди"); break;
             case "settings": d = I18n.t("У налаштуваннях"); st = I18n.t("Налаштовує запускач"); break;
             case "console": d = I18n.t("У консолі"); st = I18n.t("Читає записи гри"); break;
+            case "library": d = I18n.t("У бібліотеці збірок"); st = I18n.t("Переглядає свої збірки"); break;
             case "gallery": d = I18n.t("У галереї"); st = I18n.t("Дивиться знятки"); break;
             case "loaders": d = I18n.t("Додає версію"); st = I18n.t("Обирає завантажувач"); break;
             default: d = I18n.t("На головній сторінці"); st = I18n.t("Обирає версію"); break;
@@ -749,6 +1112,7 @@ final class LauncherWindow extends JFrame {
     static String titleOf(String k) {
         switch (k) {
             case "mods": return I18n.t("Збірки");
+            case "library": return I18n.t("Бібліотека збірок");
             case "console": return I18n.t("Консоль");
             case "gallery": return I18n.t("Галерея");
             case "loaders": return I18n.t("Додати версію");
@@ -772,7 +1136,7 @@ final class LauncherWindow extends JFrame {
     }
 
     void warmPages() {
-        final String[] keys = {"play", "mods", "gallery", "console", "settings", "loaders"};
+        final String[] keys = {"play", "mods", "library", "gallery", "console", "settings", "loaders"};
         final int[] i = {0};
         final java.awt.image.BufferedImage[] scratch = {null};
         javax.swing.Timer wt = new javax.swing.Timer(70, null);
@@ -804,6 +1168,7 @@ final class LauncherWindow extends JFrame {
     boolean pageShown;
 
     void showPage(String key) {
+        if (key.equals("mods")) manageFromLib = false;
         if (pageShown && key.equals(curPage)) return;
         pageShown = true;
         if (!key.equals("settings") && curPage.equals("settings")) {
@@ -828,9 +1193,12 @@ final class LauncherWindow extends JFrame {
         }
         if (backB != null) { backB.setEnabled(hpos > 0); fwdB.setEnabled(hpos < hist.size() - 1); }
         if (key.equals("gallery")) refreshGallery();
+        if (key.equals("library")) refreshLibrary();
     }
 
     void exit() {
+        try { hostStop(); } catch (Throwable ignored) { }
+        try { Upnp.closeAll(); } catch (Throwable ignored) { }
         try { saveVersion(); } catch (Throwable ignored) { }
         try { dispose(); } catch (Throwable ignored) { }
         Thread w = new Thread(() -> {
@@ -870,7 +1238,7 @@ final class LauncherWindow extends JFrame {
         side.setBorder(new EmptyBorder(8, 0, 10, 0));
         side.setPreferredSize(new Dimension(Theme.SIDE_W, 0));
 
-        String[][] top = {{"play", I18n.t("Головна"), "0"}, {"mods", I18n.t("Збірки"), "1"}, {"gallery", I18n.t("Галерея"), "6"}, {"console", I18n.t("Консоль"), "3"}};
+        String[][] top = {{"play", I18n.t("Головна"), "0"}, {"library", I18n.t("Бібліотека"), "7"}, {"mods", I18n.t("Збірки"), "1"}, {"gallery", I18n.t("Галерея"), "6"}, {"console", I18n.t("Консоль"), "3"}};
         for (String[] it : top) {
             NavBtn b = new NavBtn("", it[1], Integer.parseInt(it[2]));
             b.addActionListener(e -> showPage(it[0]));
@@ -958,10 +1326,13 @@ final class LauncherWindow extends JFrame {
         JPanel links = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, (Theme.TITLE_H - 34) / 2));
         links.setOpaque(false);
         LinkBtn dcL = new LinkBtn(I18n.t("Приєднатися до нашого Discord"), 0);
+        LinkBtn siteL = new LinkBtn(I18n.t("Сайт запускача"), 2);
         LinkBtn donL = new LinkBtn(I18n.t("Підтримати запускач"), 1);
+        siteL.addActionListener(e -> browse(SITE_URL));
         dcL.addActionListener(e -> browse(DISCORD_URL));
         donL.addActionListener(e -> browse(SUPPORT_URL));
         links.add(dcL);
+        links.add(siteL);
         links.add(donL);
 
         top.add(left, BorderLayout.WEST);
@@ -1047,21 +1418,8 @@ final class LauncherWindow extends JFrame {
         rp.row(header(I18n.t("Поточна обліківка")), 0);
         rp.row(accountTile(), 12);
 
-        rp.row(header(I18n.t("Швидкі дії")), 26);
-        JPanel acts = new JPanel(new GridLayout(0, 1, 0, 2));
-        acts.setOpaque(false);
-        ListBtn b1 = new ListBtn(I18n.t("Папка гри"), 5);
-        ListBtn b2 = new ListBtn(I18n.t("Збірки"), 1);
-        ListBtn b3 = new ListBtn(I18n.t("Консоль"), 3);
-        ListBtn bg2 = new ListBtn(I18n.t("Галерея"), 6);
-        bg2.addActionListener(e -> showPage("gallery"));
-        ListBtn b4 = new ListBtn(I18n.t("Налаштування"), 2);
-        b1.addActionListener(e -> openFolder(gameDir()));
-        b2.addActionListener(e -> showPage("mods"));
-        b3.addActionListener(e -> showPage("console"));
-        b4.addActionListener(e -> showPage("settings"));
-        for (ListBtn b : new ListBtn[]{b1, b2, bg2, b3, b4}) acts.add(b);
-        rp.row(acts, 8);
+        rp.row(header(I18n.t("Гра з другом")), 26);
+        rp.row(friendsCard(), 8);
 
         rp.row(header(I18n.t("Сервери Minecraft")), 26);
         rp.row(new ServerAds(this::browse), 12);
@@ -1117,7 +1475,7 @@ final class LauncherWindow extends JFrame {
         g.gridy = 1; g.gridx = 0; g.weightx = 1; g.insets = new Insets(12, 0, 0, 0);
         jump.add(filters, g);
         small(loadersBtn);
-        loadersBtn.setText(I18n.t("Додати версію"));
+        loadersBtn.setText(I18n.t("Створити збірку"));
         loadersBtn.setPlus(true);
         loadersBtn.setPreferredSize(new Dimension(190, 42));
         g.gridx = 1; g.weightx = 0; g.insets = new Insets(12, 14, 0, 0);
@@ -1142,6 +1500,8 @@ final class LauncherWindow extends JFrame {
         g.gridy = 3; g.gridx = 0; g.weightx = 1; g.insets = new Insets(8, 0, 0, 0);
         jump.add(bar, g);
         col.row(jump, 12);
+
+        col.row(libraryBanner(), 16);
 
         JLabel disc = header(I18n.t("Відкрий для себе  ›"));
         col.row(disc, 30);
@@ -1174,8 +1534,507 @@ final class LauncherWindow extends JFrame {
         playBtn.addActionListener(e -> play());
         cancelBtn.addActionListener(e -> cancelDownload());
         pauseBtn.addActionListener(e -> togglePause());
-        loadersBtn.addActionListener(e -> openLoaders());
+        loadersBtn.addActionListener(e -> newProfile());
         return p;
+    }
+
+    // ---------- «Гра з другом» ----------
+    LanProxy lan;                      // активна сесія хоста
+    volatile String inviteCode;        // код активної сесії хоста
+    volatile String inviteNote = " ";
+    volatile String joinTarget, pendingJoin, joinCode, hostWorld;
+    volatile int hostLanPort;
+    volatile String hostAgentMsg;
+    volatile boolean hostAlive;
+    javax.swing.Timer lanTimer;
+    volatile Process joinProc;         // гра, запущена для приєднання
+    final JLabel friendsLbl = label(" ", 12, false, Theme.MUTED);
+    Field inviteOut;
+    JLabel inviteNoteL, hostWorldL;
+    Combo<String> hostPlayers, hostBanned;
+    static final Pattern LAN_PORT = Pattern.compile("(?iu)\\[CHAT\\].*?\\b(?:port|порт\\p{L}*)\\D{0,6}(\\d{4,5})");
+
+    Btn hostBtn;
+    final JLabel friendsNote = label(" ", 11, false, Theme.MUTED);
+
+    JPanel friendsCard() {
+        Btn jb = small(new Btn(I18n.t("Приєднатися"), Btn.Kind.SECONDARY));
+        Btn hb = small(new Btn(I18n.t("Створити"), Btn.Kind.PRIMARY));
+        hostBtn = hb;
+        jb.addActionListener(e -> openJoin());
+        hb.addActionListener(e -> openHost());
+        JPanel row = new JPanel(new GridLayout(2, 1, 0, 8));
+        row.setOpaque(false);
+        row.add(jb);
+        row.add(hb);
+        JPanel p = new JPanel(new BorderLayout(0, 8));
+        p.setOpaque(false);
+        p.add(row, BorderLayout.NORTH);
+        JPanel info = new JPanel(new BorderLayout(0, 6));
+        info.setOpaque(false);
+        info.add(friendsLbl, BorderLayout.NORTH);
+        info.add(friendsNote, BorderLayout.CENTER);
+        p.add(info, BorderLayout.CENTER);
+        // клік по «Сесія: PAX-…» копіює код
+        friendsLbl.addMouseListener(new MouseAdapter() {
+            @Override public void mouseClicked(MouseEvent e) {
+                String c = inviteCode;
+                if (lan == null || c == null) return;
+                copyText(c);
+                friendsLbl.setText(I18n.t("Код скопійовано"));
+                javax.swing.Timer t = new javax.swing.Timer(1300, ev -> refreshFriendsCard());
+                t.setRepeats(false);
+                t.start();
+            }
+        });
+        return p;
+    }
+
+    void refreshFriendsCard() {
+        String t = " ";
+        if (lan != null) {
+            if (inviteCode == null) t = I18n.t("Створюю сесію…");
+            else if (hostAlive) t = I18n.t("Сесія: ") + inviteCode;
+            else t = "<html>" + I18n.t("Сесія: ") + inviteCode + "<br>" + I18n.t("світ ще не відкрито") + "</html>";
+        }
+        else if (joinCode != null) t = I18n.t("Приєднано: ") + joinCode;
+        friendsLbl.setText(t);
+        friendsNote.setText(lan != null
+                ? "<html><div style='width:170px'>" + I18n.t("Якщо закрити запускач — сервер вимкнеться.") + "</div></html>" : " ");
+        if (hostBtn != null) {
+            hostBtn.setText(lan != null ? I18n.t("Налаштування") : I18n.t("Створити"));
+            hostBtn.revalidate(); hostBtn.repaint();
+        }
+        friendsLbl.setCursor(Cursor.getPredefinedCursor(lan != null && inviteCode != null ? Cursor.HAND_CURSOR : Cursor.DEFAULT_CURSOR));
+    }
+
+    /** Слідкує за логом гри: коли хост відкрив світ для мережі, сесія спрямовує гравців у нього. */
+    Path flagPath() { return root.resolve("runtime").resolve("lan-joined.flag"); }
+
+    static String wrapHtml(String s) {
+        if (s == null || s.trim().isEmpty()) return " ";
+        return "<html><div style='width:380px'>" + s.replace("&", "&amp;").replace("<", "&lt;") + "</div></html>";
+    }
+
+    static List<String> worldsOf(Path inst) {
+        List<String> out = new ArrayList<>();
+        Path saves = inst.resolve("saves");
+        if (!Files.isDirectory(saves)) return out;
+        try (var st = Files.list(saves)) {
+            st.filter(p -> Files.isRegularFile(p.resolve("level.dat"))).forEach(p -> out.add(p.getFileName().toString()));
+        } catch (IOException ignored) { }
+        out.sort(String.CASE_INSENSITIVE_ORDER);
+        return out;
+    }
+
+    static int freePort(int from) {
+        for (int p = from; p < from + 60; p++) {
+            try (java.net.ServerSocket s = new java.net.ServerSocket(p)) { return p; } catch (IOException ignored) { }
+        }
+        return from;
+    }
+
+    void inviteHook(String ln) {
+        LanProxy l = lan;
+        if (l != null && ln != null && ln.contains("[PaxLan]")) {
+            hostAgentMsg = ln.substring(ln.indexOf("[PaxLan]") + 8).trim();
+            SwingUtilities.invokeLater(this::refreshHostUi);
+        }
+        if (l != null && hostLanPort > 0 && ln != null && ln.contains(" joined the game")) {
+            // сигнал агенту в грі: хост зайшов у світ — можна відкривати його для мережі
+            try {
+                Path f = flagPath();
+                Files.createDirectories(f.getParent());
+                Files.writeString(f, String.valueOf(System.nanoTime()));
+            } catch (IOException ignored) { }
+        }
+        if (l == null || ln == null || !ln.contains("[CHAT]")) return;
+        java.util.regex.Matcher m = LAN_PORT.matcher(ln);
+        if (m.find()) {
+            try { l.setTarget(Integer.parseInt(m.group(1))); } catch (NumberFormatException ignored) { }
+            SwingUtilities.invokeLater(this::refreshHostUi);
+        }
+    }
+
+    void copyText(String t) {
+        try { Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new java.awt.datatransfer.StringSelection(t), null); }
+        catch (Throwable ignored) { }
+    }
+
+    String agentText() {
+        String m = hostAgentMsg == null ? "" : hostAgentMsg;
+        String manual = I18n.t(" Відкрий світ вручну: Пауза → Відкрити для мережі.");
+        if (m.startsWith("PUBLISHED")) return I18n.t("Світ відкрито для мережі…");
+        if (m.startsWith("WORLD")) return I18n.t("Ти у світі — відкриваю його для друзів…");
+        if (m.startsWith("NOCLASS")) return I18n.t("Агент не знайшов потрібні класи гри.") + manual;
+        if (m.startsWith("NOOFFLINE")) return I18n.t("Не вдалося дозволити неліцензійних гравців — вони не зайдуть.");
+        if (m.startsWith("OFFLINE")) return I18n.t("Неліцензійні гравці дозволені…");
+        if (m.startsWith("FAIL") || m.startsWith("RETRY")) return I18n.t("Автоматично не вийшло (") + m + ")." + manual;
+        if (m.startsWith("LOADED")) return I18n.t("Агент підключено. Чекаю, поки ти зайдеш у світ «") + hostWorld + "»…";
+        return I18n.t("Чекаю, поки ти зайдеш у світ «") + hostWorld + "»…";
+    }
+
+    static void fillCombo(Combo<String> cb, List<String> items) {
+        if (cb == null) return;
+        List<String> cur = new ArrayList<>();
+        for (int i = 0; i < cb.getItemCount(); i++) cur.add(cb.getItemAt(i));
+        if (cur.equals(items)) return;
+        Object sel = cb.getSelectedItem();
+        cb.removeAllItems();
+        for (String x : items) cb.addItem(x);
+        if (sel != null && items.contains(String.valueOf(sel))) cb.setSelectedItem(sel);
+    }
+
+    void saveBans() {
+        LanProxy l = lan;
+        if (l != null) { cfg.set("hostBans", String.join(",", l.banEntries())); cfg.save(); }
+    }
+
+    void refreshHostUi() {
+        LanProxy l = lan;
+        if (l != null) { fillCombo(hostPlayers, l.playerNames()); fillCombo(hostBanned, l.bans()); }
+        if (inviteOut != null) inviteOut.setText(inviteCode == null ? "" : inviteCode);
+        if (inviteNoteL != null) inviteNoteL.setText(wrapHtml(inviteNote));
+        if (hostWorldL != null && l != null) {
+            new Thread(() -> {
+                boolean a = l.alive();
+                int n = l.players();
+                SwingUtilities.invokeLater(() -> {
+                    if (hostWorldL != null) hostWorldL.setText(a ? I18n.t("Світ відкрито · гравців зараз: ") + n
+                            : hostWorld != null ? agentText()
+                            : I18n.t("Чекаю, поки ти відкриєш світ для мережі…"));
+                });
+            }, "host-state").start();
+        }
+    }
+
+    /** Створює сесію: випадковий порт, UPnP, код запрошення. Код чинний, доки сесія активна. */
+    void hostStart() {
+        if (lan != null) return;
+        Accounts.Acc acc = accounts.current();
+        LanProxy l = new LanProxy(acc == null ? "" : acc.name());
+        l.setBans(Arrays.asList(cfg.get("hostBans", "").split(",")));
+        int port = 0;
+        Random rnd = new Random();
+        for (int i = 0; i < 60 && port == 0; i++) {
+            boolean reuse = i == 0 && cfg.getb("noUpnp", false) && cfg.geti("hostPort", 0) > 0;
+            int p = reuse ? cfg.geti("hostPort", 0) : 30000 + rnd.nextInt(30000);
+            try { l.start(p); port = p; } catch (IOException ignored) { }
+        }
+        if (port == 0) { msg(I18n.t("Не вдалося відкрити порт для сесії.")); return; }
+        final int fport = port;
+        lan = l;
+        inviteCode = null;
+        inviteNote = " ";
+        hostAlive = false;
+        if (lanTimer != null) lanTimer.stop();
+        lanTimer = new javax.swing.Timer(3000, e -> {
+            LanProxy cur = lan;
+            if (cur == null) return;
+            new Thread(() -> {
+                boolean al = cur.alive();
+                if (al != hostAlive) {
+                    hostAlive = al;
+                    SwingUtilities.invokeLater(this::refreshFriendsCard);
+                }
+            }, "lan-alive").start();
+        });
+        lanTimer.start();
+        refreshFriendsCard();
+        new Thread(() -> {
+            Upnp.Result r = Upnp.open(fport);
+            SwingUtilities.invokeLater(() -> {
+                if (lan != l) { Upnp.close(fport); return; }
+                String code = r.ip == null ? null : Invite.encode(r.ip, fport);
+                if (code == null) {
+                    hostStop();
+                    msg(I18n.t(r.note));
+                    return;
+                }
+                inviteCode = code;
+                inviteNote = r.note;
+                cfg.set("noUpnp", String.valueOf(!r.mapped));
+                if (!r.mapped) cfg.set("hostPort", String.valueOf(fport));
+                cfg.save();
+                copyText(code);
+                log(I18n.t("Код сесії: ") + code + (r.note.trim().isEmpty() ? "" : "  ·  " + r.note));
+                refreshFriendsCard();
+                refreshHostUi();
+            });
+        }, "host-open").start();
+    }
+
+    void hostStop() {
+        LanProxy l = lan;
+        lan = null;
+        if (l != null) {
+            l.stop();
+            try { Upnp.close(l.port()); } catch (Throwable ignored) { }
+        }
+        inviteCode = null;
+        inviteNote = " ";
+        hostWorld = null;
+        hostLanPort = 0;
+        hostAgentMsg = null;
+        hostAlive = false;
+        if (lanTimer != null) { lanTimer.stop(); lanTimer = null; }
+        try { Files.deleteIfExists(flagPath()); } catch (IOException ignored) { }
+        SwingUtilities.invokeLater(this::refreshFriendsCard);
+    }
+
+    Path dirOf(VItem it) {
+        return it.profile() != null ? instDir(it.profile()) : Path.of(cfg.get("gameDir", root.toString()));
+    }
+
+    void openHost() {
+        final boolean active = lan != null;
+        final Btn[] okRef = new Btn[1];
+        final Runnable[] gateRef = {() -> { }};
+        javax.swing.Timer tm = null;
+        Combo<VItem> vc = new Combo<>();
+        Combo<String> wc = new Combo<>();
+        Check offC = new Check(I18n.t("Дозволяти вхід з неліцензійних акаунтів"), cfg.getb("allowOffline", false));
+        offC.setFont(Theme.font(Font.PLAIN, 13));
+        JPanel pn = new JPanel();
+        pn.setOpaque(false);
+        pn.setLayout(new BoxLayout(pn, BoxLayout.Y_AXIS));
+        if (!active) {
+            VItem cur = versions.getSelectedItem() instanceof VItem ? (VItem) versions.getSelectedItem() : null;
+            for (int i = 0; i < versions.getItemCount(); i++) {
+                VItem it = versions.getItemAt(i);
+                if (it.installed()) vc.addItem(it);
+            }
+            if (cur != null) vc.setSelectedItem(cur);
+            Runnable reload = () -> {
+                wc.removeAllItems();
+                Object o = vc.getSelectedItem();
+                if (o instanceof VItem) for (String w : worldsOf(dirOf((VItem) o))) wc.addItem(w);
+                gateRef[0].run();
+            };
+            vc.addActionListener(e -> reload.run());
+            wc.addActionListener(e -> gateRef[0].run());
+            for (JComponent c : new JComponent[]{vc, wc}) {
+                c.setPreferredSize(new Dimension(200, 38));
+                c.setMaximumSize(new Dimension(Integer.MAX_VALUE, 38));
+            }
+            wc.placeholder = I18n.t("У цій збірці ще немає світів");
+            for (JComponent c : new JComponent[]{
+                    label(I18n.t("Версія або збірка"), 12, true, Theme.MUTED), vc,
+                    label(" ", 6, false, Theme.MUTED),
+                    label(I18n.t("Світ, який відкриється для друзів"), 12, true, Theme.MUTED), wc,
+                    label(" ", 6, false, Theme.MUTED), offC}) {
+                c.setAlignmentX(Component.LEFT_ALIGNMENT);
+                pn.add(c);
+            }
+            gateRef[0] = () -> { if (okRef[0] != null) okRef[0].setEnabled(vc.getSelectedItem() != null && wc.getSelectedItem() != null); };
+            reload.run();
+        } else {
+            inviteOut = new Field(inviteCode == null ? "" : inviteCode);
+            inviteOut.setEditable(false);
+            inviteOut.setHint(I18n.t("Створюю код…"));
+            inviteOut.setPreferredSize(new Dimension(200, 38));
+            inviteOut.setMaximumSize(new Dimension(Integer.MAX_VALUE, 38));
+            Btn copy = tiny(new Btn(I18n.t("Копіювати"), Btn.Kind.SECONDARY));
+            copy.addActionListener(e -> { String t = inviteOut.getText(); if (!t.isEmpty()) copyText(t); });
+            JPanel codeRow = new JPanel(new BorderLayout(8, 0));
+            codeRow.setOpaque(false);
+            codeRow.add(inviteOut, BorderLayout.CENTER);
+            codeRow.add(copy, BorderLayout.EAST);
+            hostWorldL = label(" ", 12, false, Theme.MUTED);
+            hostWorldL.setPreferredSize(new Dimension(Theme.px(400), Theme.px(40)));
+            hostWorldL.setVerticalAlignment(SwingConstants.TOP);
+            hostPlayers = new Combo<>();
+            hostPlayers.placeholder = I18n.t("Нікого немає");
+            hostBanned = new Combo<>();
+            hostBanned.placeholder = I18n.t("Список порожній");
+            for (JComponent c : new JComponent[]{hostPlayers, hostBanned}) {
+                c.setPreferredSize(new Dimension(200, 38));
+                c.setMaximumSize(new Dimension(Integer.MAX_VALUE, 38));
+            }
+            Btn kickB = tiny(new Btn(I18n.t("Від'єднати"), Btn.Kind.SECONDARY));
+            Btn banB = tiny(new Btn(I18n.t("Забанити"), Btn.Kind.SECONDARY));
+            Btn unbanB = tiny(new Btn(I18n.t("Розбанити"), Btn.Kind.SECONDARY));
+            kickB.addActionListener(e -> {
+                Object n = hostPlayers.getSelectedItem();
+                if (lan != null && n != null) { lan.kick(String.valueOf(n)); refreshHostUi(); }
+            });
+            banB.addActionListener(e -> {
+                Object n = hostPlayers.getSelectedItem();
+                if (lan != null && n != null) { lan.ban(String.valueOf(n)); saveBans(); refreshHostUi(); }
+            });
+            unbanB.addActionListener(e -> {
+                Object n = hostBanned.getSelectedItem();
+                if (lan != null && n != null) { lan.unban(String.valueOf(n)); saveBans(); refreshHostUi(); }
+            });
+            JPanel pBtns = new JPanel(new GridLayout(1, 2, 6, 0));
+            pBtns.setOpaque(false);
+            pBtns.add(kickB);
+            pBtns.add(banB);
+            JPanel pRow = new JPanel(new BorderLayout(8, 0));
+            pRow.setOpaque(false);
+            pRow.add(hostPlayers, BorderLayout.CENTER);
+            pRow.add(pBtns, BorderLayout.EAST);
+            JPanel bRow = new JPanel(new BorderLayout(8, 0));
+            bRow.setOpaque(false);
+            bRow.add(hostBanned, BorderLayout.CENTER);
+            bRow.add(unbanB, BorderLayout.EAST);
+            for (JComponent c : new JComponent[]{
+                    label(I18n.t("Код сесії — скинь його друзям:"), 12, true, Theme.MUTED), codeRow, hostWorldL,
+                    label(I18n.t("Гравці в сесії"), 12, true, Theme.MUTED), pRow,
+                    label(I18n.t("Забанені"), 12, true, Theme.MUTED), bRow}) {
+                c.setAlignmentX(Component.LEFT_ALIGNMENT);
+                pn.add(c);
+                pn.add(Box.createVerticalStrut(5));
+            }
+            refreshHostUi();
+            tm = new javax.swing.Timer(2000, e -> refreshHostUi());
+            tm.start();
+        }
+        pn.setPreferredSize(new Dimension(Theme.px(440), pn.getPreferredSize().height));
+        boolean ok = Dlg.show(this, I18n.t("Створити сесію"), pn, active ? I18n.t("Вимкнути сесію") : I18n.t("Створити"),
+                I18n.t("Закрити"), null, b -> { okRef[0] = b; gateRef[0].run(); });
+        if (tm != null) tm.stop();
+        inviteOut = null;
+        inviteNoteL = null;
+        hostWorldL = null;
+        hostPlayers = null;
+        hostBanned = null;
+        if (!ok) return;
+        if (active) { hostStop(); status.setText(I18n.t("Сесію вимкнено")); return; }
+        cfg.set("allowOffline", String.valueOf(offC.isSelected()));
+        cfg.save();
+        Object so = vc.getSelectedItem();
+        Object w = wc.getSelectedItem();
+        if (!(so instanceof VItem) || w == null) return;
+        if (!running.isEmpty()) {
+            msg(I18n.t("Спочатку закрий запущену гру: світ відкриється для друзів сам, якщо запустити її через «Створити»."));
+            return;
+        }
+        hostStart();
+        if (lan == null) return;
+        hostWorld = String.valueOf(w);
+        hostLanPort = freePort(25565);
+        lan.setTarget(hostLanPort);
+        fillVersions(((VItem) so).key());
+        play();
+    }
+
+    void openJoin() {
+        if (joinCode != null) {
+            JPanel pn = new JPanel();
+            pn.setOpaque(false);
+            pn.setLayout(new BoxLayout(pn, BoxLayout.Y_AXIS));
+            JLabel a = label(I18n.t("Ти приєднаний до сесії ") + joinCode, 13, true, Theme.TEXT);
+            a.setAlignmentX(Component.LEFT_ALIGNMENT);
+            pn.add(a);
+            pn.setPreferredSize(new Dimension(Theme.px(400), pn.getPreferredSize().height + 6));
+            if (Dlg.show(this, I18n.t("Приєднатися"), pn, I18n.t("Від'єднатися"), I18n.t("Закрити"))) joinDisconnect();
+            return;
+        }
+        Field codeIn = new Field("");
+        codeIn.setHint(I18n.t("Код: PAX-XXXX-XXXX-XXXX"));
+        codeIn.setPreferredSize(new Dimension(Theme.px(400), 38));
+        final Btn[] okRef = new Btn[1];
+        Runnable gate = () -> { if (okRef[0] != null) okRef[0].setEnabled(Invite.decode(codeIn.getText()) != null); };
+        codeIn.getDocument().addDocumentListener(simpleDoc(gate));
+        boolean ok = Dlg.show(this, I18n.t("Приєднатися"), codeIn, I18n.t("Приєднатися"), I18n.t("Скасувати"), null,
+                b -> { okRef[0] = b; gate.run(); });
+        if (ok) joinWithCode(codeIn.getText());
+    }
+
+    void joinWithCode(String code) {
+        String[] t = Invite.decode(code);
+        if (t == null) { msg(I18n.t("Невірний код запрошення.")); return; }
+        if (joinCode != null) { msg(I18n.t("Ти вже приєднаний до сесії.")); return; }
+        String ip = t[0];
+        int port = Integer.parseInt(t[1]);
+        String norm = Invite.encode(ip, port);
+        status.setText(I18n.t("Перевіряю сесію…"));
+        new Thread(() -> {
+            // той самий комп'ютер (інший екземпляр лаунчера): ходимо через 127.0.0.1, без петлі через роутер
+            String me = Upnp.publicIp();
+            final String tgt = me != null && me.equals(ip) ? "127.0.0.1" : ip;
+            int st = LanProxy.probe(tgt, port);
+            SwingUtilities.invokeLater(() -> {
+                status.setText(" ");
+                if (st == 2) { msg(I18n.t("Сесія неактивна: хост її вимкнув, або код застарів.")); return; }
+                if (st == 1) { msg(I18n.t("Хост ще не відкрив світ для мережі. Спробуй трохи пізніше.")); return; }
+                // запис «Гра з друзями» додаємо в список серверів усіх збірок, щоб він був у будь-якій, з якої запустиш гру
+                String logo = LanProxy.logoBase64();
+                for (Path d : allGameDirs()) {
+                    try { Nbt.addServer(d.resolve("servers.dat"), "Гра з друзями", tgt + ":" + port, logo); }
+                    catch (Exception ex) { log("servers.dat: " + ex.getMessage()); }
+                }
+                joinTarget = tgt + ":" + port;
+                pendingJoin = norm;
+                play();
+            });
+        }, "join-probe").start();
+    }
+
+    void startJoinMonitor(String code, String target) {
+        String[] hp = target.split(":");
+        String ip = hp[0];
+        int port = Integer.parseInt(hp[1]);
+        Thread t = new Thread(() -> {
+            int fails = 0;
+            while (code.equals(joinCode)) {
+                try { Thread.sleep(6000); } catch (InterruptedException e) { return; }
+                if (!code.equals(joinCode)) return;
+                fails = LanProxy.probe(ip, port) != 0 ? fails + 1 : 0;
+                if (fails >= 2) {
+                    joinCode = null;
+                    SwingUtilities.invokeLater(() -> {
+                        refreshFriendsCard();
+                        status.setText(I18n.t("Хост вийшов зі світу або вимкнув сесію — тебе від'єднано."));
+                    });
+                    return;
+                }
+            }
+        }, "join-monitor");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Від'єднатися: закриває гру, запущену для цієї сесії. */
+    void joinDisconnect() {
+        Process p = joinProc;
+        joinCode = null;
+        refreshFriendsCard();
+        if (p != null && p.isAlive()) p.destroy();
+        status.setText(I18n.t("Від'єднано від сесії."));
+    }
+
+    static javax.swing.event.DocumentListener simpleDoc(Runnable r) {
+        return new javax.swing.event.DocumentListener() {
+            @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { r.run(); }
+            @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { r.run(); }
+            @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { r.run(); }
+        };
+    }
+
+    /** Помітний блок на головній: тут можна створити свою збірку й відкрити бібліотеку збірок. */
+    JPanel libraryBanner() {
+        Card c = new Card(new BorderLayout(16, 0), 16);
+        JPanel txt = new JPanel();
+        txt.setOpaque(false);
+        txt.setLayout(new BoxLayout(txt, BoxLayout.Y_AXIS));
+        JLabel a = label(I18n.t("Твої збірки"), 17, true, Theme.TEXT);
+        JLabel b = label(I18n.t("Окрема копія гри зі своїми модами, світами й налаштуваннями."), 13, false, Theme.MUTED);
+        a.setAlignmentX(Component.LEFT_ALIGNMENT);
+        b.setAlignmentX(Component.LEFT_ALIGNMENT);
+        txt.add(a);
+        txt.add(Box.createVerticalStrut(4));
+        txt.add(b);
+        c.add(txt, BorderLayout.CENTER);
+        Btn lib = small(new Btn(I18n.t("Бібліотека"), Btn.Kind.PRIMARY));
+        lib.setPreferredSize(new Dimension(170, 42));
+        lib.addActionListener(e -> showPage("library"));
+        JPanel bt = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        bt.setOpaque(false);
+        bt.add(lib);
+        c.add(bt, BorderLayout.EAST);
+        return c;
     }
 
     JPanel consolePage() {
@@ -1218,13 +2077,13 @@ final class LauncherWindow extends JFrame {
         cfg.save();
         final boolean wasMax = maxed;
         final Rectangle nb = wasMax && restoreBounds != null ? new Rectangle(restoreBounds) : getBounds();
-        final String page = curPage, logText = console.getText();
+        final String page = curPage;
+        final List<LogEnt> logKeep = new ArrayList<>(logAll);
         I18n.init(code);
         Theme.setScale(1.0);
         LauncherWindow nw = new LauncherWindow();
         nw.setBounds(nb);
-        nw.console.setText(logText);
-        nw.console.setCaretPosition(nw.console.getDocument().getLength());
+        nw.loadLog(logKeep);
         nw.showPage(page);
         nw.setVisible(true);
         if (wasMax) SwingUtilities.invokeLater(nw::toggleMaxPlain);
@@ -1518,14 +2377,40 @@ final class LauncherWindow extends JFrame {
         head.add(label(I18n.t("Консоль"), 14, true, Theme.TEXT), BorderLayout.WEST);
         Btn clear = small(new Btn(I18n.t("Очистити"), Btn.Kind.GHOST));
         clear.setBorder(new EmptyBorder(5, 12, 5, 12));
-        clear.addActionListener(e -> console.setText(""));
+        clear.addActionListener(e -> clearConsole());
         head.add(clear, BorderLayout.EAST);
-        c.add(head, BorderLayout.NORTH);
+
+        JPanel filt = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        filt.setOpaque(false);
+        for (Lvl l : Lvl.values()) {
+            Check ch = new Check(lvlName(l) + " 0", l != Lvl.DEBUG);
+            ch.setFont(Theme.font(Font.PLAIN, 13));
+            ch.setBorder(new EmptyBorder(0, 0, 0, 18));
+            ch.setForeground(l == Lvl.INFO ? Theme.TEXT : lvlColor(l));
+            ch.addActionListener(e -> rebuildConsole());
+            lvlChecks.put(l, ch);
+            filt.add(ch);
+        }
+        conQ.setHint(I18n.t("Пошук у журналі…"));
+        conQ.setPreferredSize(new Dimension(260, 36));
+        conQ.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            void ch() { rebuildConsole(); }
+            @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { ch(); }
+            @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { ch(); }
+            @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { ch(); }
+        });
+        JPanel bar2 = new JPanel(new BorderLayout(12, 0));
+        bar2.setOpaque(false);
+        bar2.add(filt, BorderLayout.CENTER);
+        bar2.add(conQ, BorderLayout.EAST);
+        JPanel north = new JPanel(new BorderLayout(0, 10));
+        north.setOpaque(false);
+        north.add(head, BorderLayout.NORTH);
+        north.add(bar2, BorderLayout.CENTER);
+        c.add(north, BorderLayout.NORTH);
 
         Color dark = Theme.INPUT;
         console.setEditable(false);
-        console.setLineWrap(true);
-        console.setWrapStyleWord(true);
         console.setOpaque(false);
         console.setForeground(Theme.CONSOLE_FG);
         console.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
@@ -1883,80 +2768,57 @@ final class LauncherWindow extends JFrame {
         playBtn.setText(busy ? I18n.t("Зачекай…") : curRunning ? I18n.t("Гра запущена") : I18n.t("Грати"));
     }
 
+    /** Вміст діалогу «Додати версію» (збирається один раз; сторінки більше немає). */
     JPanel loadersPage() {
-        JPanel p = new JPanel(new BorderLayout(0, 18));
-        p.setOpaque(false);
-        p.setBorder(new EmptyBorder(24, 28, 26, 28));
+        final String[] LD = {"Vanilla", "Fabric", "Quilt", "Forge", "NeoForge"};
+        for (String nm : LD) lType.addItem(nm);
+        lType.setSelectedItem("Fabric");
+        for (JComponent cb : new JComponent[]{lMc, lVer}) {
+            cb.setPreferredSize(new Dimension(340, 42));
+            cb.setMaximumSize(new Dimension(Integer.MAX_VALUE, 42));
+        }
 
-        JPanel head = new JPanel();
-        head.setOpaque(false);
-        head.setLayout(new BoxLayout(head, BoxLayout.Y_AXIS));
-        JLabel t = label(I18n.t("Додати версію"), 26, true, Theme.TEXT);
-                t.setAlignmentX(Component.LEFT_ALIGNMENT);
-        head.add(t);
-        head.add(Box.createVerticalStrut(4));
-                Btn back = small(new Btn(I18n.t("Назад"), Btn.Kind.SECONDARY));
-        back.addActionListener(e -> showPage("play"));
-        JPanel backP = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
-        backP.setOpaque(false);
-        backP.add(back);
-        JPanel hw = new JPanel(new BorderLayout());
-        hw.setOpaque(false);
-        hw.add(head, BorderLayout.WEST);
-        hw.add(backP, BorderLayout.EAST);
-        p.add(hw, BorderLayout.NORTH);
+        // той самий вигляд, що й у створенні збірки: плитки завантажувачів + списки версій
+        JPanel tileRow = new JPanel(new GridLayout(1, LD.length, 8, 0));
+        tileRow.setOpaque(false);
+        for (String nm : LD) {
+            LoaderTile lt = new LoaderTile(nm, () -> {
+                lType.setSelectedItem(nm);
+                for (LoaderTile x : tileRowTiles(tileRow)) x.setSel(x.name.equals(nm));
+            });
+            lt.setSel(nm.equals("Fabric"));
+            tileRow.add(lt);
+        }
 
-        lType.addItem("Vanilla");
-        lType.addItem("Fabric");
-        lType.addItem("Quilt");
-        lType.addItem("Forge");
-        lType.addItem("NeoForge");
-        for (JComponent cb : new JComponent[]{lMc, lType, lVer}) cb.setPreferredSize(new Dimension(300, 44));
-
-        Card c = new Card(new GridBagLayout(), 22);
-        row(c, 0, I18n.t("Версія Minecraft"), lMc, null);
-        row(c, 1, I18n.t("Завантажувач"), lType, null);
-        row(c, 2, I18n.t("Версія завантажувача"), lVer, null);
-        JPanel ib = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 0));
-        ib.setBorder(new EmptyBorder(0, -12, 0, 0));
-        ib.setOpaque(false);
-        ib.add(lInstall);
-        small(lCancel);
-        small(lPause);
-        lCancel.setVisible(false);
-        lPause.setVisible(false);
-        ib.add(lPause);
-        ib.add(lCancel);
-        row(c, 3, "", ib, null);
-
-        JPanel center = new JPanel(new BorderLayout());
-        center.setOpaque(false);
-        center.add(c, BorderLayout.NORTH);
-        p.add(center, BorderLayout.CENTER);
-
-        JPanel bottom = new JPanel();
-        bottom.setOpaque(false);
-        bottom.setLayout(new BoxLayout(bottom, BoxLayout.Y_AXIS));
-        lStatus.setAlignmentX(Component.LEFT_ALIGNMENT);
-        bottom.add(lStatus);
-        bottom.add(Box.createVerticalStrut(8));
-        bottom.add(lBar);
-        p.add(bottom, BorderLayout.SOUTH);
+        JPanel col = new JPanel();
+        col.setOpaque(false);
+        col.setLayout(new BoxLayout(col, BoxLayout.Y_AXIS));
+        for (JComponent c : new JComponent[]{
+                label(I18n.t("Завантажувач"), 13, true, Theme.MUTED), tileRow,
+                label(" ", 6, false, Theme.MUTED),
+                label(I18n.t("Версія Minecraft"), 13, true, Theme.MUTED), lMc, lSnaps,
+                label(" ", 6, false, Theme.MUTED),
+                lvLbl, lVer,
+                label(" ", 6, false, Theme.MUTED), lStatus}) {
+            c.setAlignmentX(Component.LEFT_ALIGNMENT);
+            col.add(c);
+        }
+        col.setPreferredSize(new Dimension(Theme.px(500), col.getPreferredSize().height));
 
         lMc.addActionListener(e -> { if (!lFilling) loadLoaderVersions(); });
         lType.addActionListener(e -> { if (!lFilling) loadLoaderVersions(); });
-        lInstall.addActionListener(e -> installLoader());
-        lCancel.addActionListener(e -> cancelDownload());
-        lPause.addActionListener(e -> togglePause());
+        lSnaps.addActionListener(e -> fillLoaderMc());
+        // кнопка «Встановити» в діалозі повторює стан lInstall (активна, коли список версій готовий)
+        lInstall.addPropertyChangeListener("enabled", e -> { if (lOk != null) lOk.setEnabled(lInstall.isEnabled()); });
         lInstall.setEnabled(false);
-        return p;
+        return col;
     }
 
     void fillLoaderMc() {
         Object want = lMc.getSelectedItem();
         lFilling = true;
         lMc.removeAllItems();
-        for (Engine.VInfo vi : engine.manifest) if (vi.type().equals("release")) lMc.addItem(vi.id());
+        for (Engine.VInfo vi : engine.manifest) if (vi.type().equals("release") || lSnaps.isSelected()) lMc.addItem(vi.id());
         if (want != null) lMc.setSelectedItem(want);
         lFilling = false;
         loadLoaderVersions();
@@ -1970,7 +2832,13 @@ final class LauncherWindow extends JFrame {
             lFilling = false;
             loadLoaderVersions();
         }
-        showPage("loaders");
+        if (busy) { msg(I18n.t("Зачекай, поки завершиться завантаження.")); return; }
+        lStatus.setText(" ");
+        boolean ok = Dlg.show(this, I18n.t("Додати версію"), loadersBox, I18n.t("Встановити"), I18n.t("Скасувати"), null,
+                b -> { lOk = b; b.setEnabled(lInstall.isEnabled()); });
+        lOk = null;
+        lSeq.incrementAndGet();
+        if (ok) installLoader();
     }
 
     void loadLoaderVersions() {
@@ -1980,6 +2848,9 @@ final class LauncherWindow extends JFrame {
         lInstall.setEnabled(false);
         if (mo == null || to == null) return;
         String mc = (String) mo, type = (String) to;
+        boolean van = type.equals("Vanilla");
+        lVer.setEnabled(!van);
+        lvLbl.setText(van ? I18n.t("Версія завантажувача — не потрібна") : I18n.t("Версія завантажувача"));
         lStatus.setText(I18n.t("Завантаження списку версій ") + type + "…");
         new Thread(() -> {
             List<Engine.LV> list = null;
@@ -1998,7 +2869,7 @@ final class LauncherWindow extends JFrame {
                 }
                 lInstall.setEnabled(ok && !busy);
                 lStatus.setText(er != null ? I18n.t("Не вдалося отримати список: ") + er
-                        : ok ? I18n.t("Доступно версій: ") + res.size() : type + I18n.t(" не підтримує Minecraft ") + mc);
+                        : ok ? I18n.t("Готово до встановлення") : type + I18n.t(" не підтримує Minecraft ") + mc);
             });
         }, "loader-versions").start();
     }
@@ -2012,10 +2883,10 @@ final class LauncherWindow extends JFrame {
         String mc = (String) mo, type = (String) to, ver = ((Engine.LV) vo).version();
         String java = javaPath();
         setBusy(true);
-        lBar.set(0.05);
+        bar.set(0.05);
         engine.stop = false;
-        cancelUi(true, lCancel, lPause);
-        Engine.Progress pg = (t, f) -> SwingUtilities.invokeLater(() -> { lStatus.setText(t); lBar.set(f); });
+        cancelUi(true, cancelBtn, pauseBtn);
+        Engine.Progress pg = (t, f) -> SwingUtilities.invokeLater(() -> { status.setText(t); bar.set(f); });
         new Thread(() -> {
             try {
                 String id = installLoaderEnsured(type, mc, ver, java, pg);
@@ -2028,29 +2899,40 @@ final class LauncherWindow extends JFrame {
                 unhideVersion(id);
                 SwingUtilities.invokeLater(() -> {
                     fillVersions(id);
-                    lStatus.setText(I18n.t("Обери версію Minecraft і завантажувач"));
-                    status.setText(" ");
-                    lBar.set(0);
+                    status.setText(I18n.t("Готово до запуску"));
                     bar.set(0);
-                    showPage("play");
                 });
             } catch (Engine.Cancelled cx) {
                 log(I18n.t("Встановлення скасовано"));
-                SwingUtilities.invokeLater(() -> { lStatus.setText(I18n.t("Завантаження скасовано")); lBar.set(0); });
+                SwingUtilities.invokeLater(() -> { status.setText(I18n.t("Завантаження скасовано")); bar.set(0); });
             } catch (Exception ex) {
                 log(I18n.t("Помилка встановлення: ") + ex);
                 SwingUtilities.invokeLater(() -> {
-                    lStatus.setText(I18n.t("Помилка встановлення"));
-                    lBar.set(0);
+                    status.setText(I18n.t("Помилка встановлення"));
+                    bar.set(0);
                     msg(I18n.t("Не вдалося встановити ") + type + ":\n" + ex.getMessage());
                 });
             } finally {
-                SwingUtilities.invokeLater(() -> { setBusy(false); cancelUi(false, lCancel, lPause); });
+                SwingUtilities.invokeLater(() -> { setBusy(false); cancelUi(false, cancelBtn, pauseBtn); });
             }
         }, "loader-install").start();
     }
 
     Path instDir(String name) { return root.resolve("instances").resolve(name); }
+
+    /** Папки гри всіх збірок (і типова), які вже існують. */
+    List<Path> allGameDirs() {
+        List<Path> out = new ArrayList<>();
+        Path def = Path.of(cfg.get("gameDir", root.toString()));
+        if (Files.isDirectory(def)) out.add(def);
+        try {
+            for (Prof pf : loadProfiles()) {
+                Path d = instDir(pf.name());
+                if (Files.isDirectory(d) && !out.contains(d)) out.add(d);
+            }
+        } catch (Exception ignored) { }
+        return out;
+    }
 
     List<Prof> loadProfiles() {
         List<Prof> r = new ArrayList<>();
@@ -2085,6 +2967,12 @@ final class LauncherWindow extends JFrame {
         } catch (Exception e) { msg(I18n.t("Відкрий вручну: ") + url); }
     }
 
+    static Btn tiny(Btn b) {
+        b.setBorder(new EmptyBorder(6, 12, 6, 12));
+        b.setFont(Theme.bfont(Font.BOLD, 12));
+        return b;
+    }
+
     static Btn small(Btn b) {
         b.setBorder(new EmptyBorder(10, 16, 10, 16));
         b.setFont(Theme.bfont(Font.BOLD, 13));
@@ -2106,6 +2994,7 @@ final class LauncherWindow extends JFrame {
         if (pick != null) mProf.setSelectedItem(pick);
         mFilling = false;
         onProfileChanged();
+        refreshLibrary();
     }
 
     void onProfileChanged() {
@@ -2118,10 +3007,24 @@ final class LauncherWindow extends JFrame {
         mInstall.setEnabled(false);
         mMore.setEnabled(false);
         showDetails(null);
+        if (mInstalledView && kindChosen0() && curKind().isPack()) {
+            setModInfo(null);
+            updateEmptyState();
+            refreshPackList();
+            return;
+        }
+        if (kindChosen() && curKind().isPack()) {
+            setModInfo(null);
+            iModel.clear();
+            mStatus.setText(" ");
+            updateEmptyState();
+            if (modsInit) search(false, true);
+            return;
+        }
         if (p == null) {
             setModInfo(null);
             iModel.clear();
-            mStatus.setText(I18n.t("Створи збірку і шукай моди"));
+            mStatus.setText(" ");
             updateEmptyState();
             return;
         }
@@ -2143,70 +3046,58 @@ final class LauncherWindow extends JFrame {
         if (modsInit && (!k.isMod() || !p.loader().equals("Vanilla"))) search(false, true);
     }
 
+    static List<LoaderTile> tileRowTiles(JPanel row) {
+        List<LoaderTile> r = new ArrayList<>();
+        for (Component c : row.getComponents()) if (c instanceof LoaderTile) r.add((LoaderTile) c);
+        return r;
+    }
+
     void newProfile() {
         if (engine.manifest.isEmpty()) { msg(I18n.t("Список версій Minecraft ще завантажується — спробуй за мить.")); return; }
-        List<String> installedLd = new ArrayList<>();
-        for (String id : engine.installedIds()) {
-            String ld = Engine.detectLoader(id);
-            if (ld.equals("Fabric") || ld.equals("Quilt") || ld.equals("Forge") || ld.equals("NeoForge")) installedLd.add(id);
-        }
         Field name = new Field("");
-        Combo<String> mode = new Combo<>();
-        mode.addItem(I18n.t("Обрати версію гри й завантажувач"));
-        if (!installedLd.isEmpty()) mode.addItem(I18n.t("Взяти вже встановлену версію"));
+        final String[] LD = {"Vanilla", "Fabric", "Quilt", "Forge", "NeoForge"};
+        final String[] sel = {"Fabric"};
         Combo<String> mc = new Combo<>();
-        for (Engine.VInfo vi : engine.manifest) if (vi.type().equals("release")) mc.addItem(vi.id());
-        Combo<String> type = new Combo<>();
-        for (String ty : new String[]{"Fabric", "Quilt", "Forge", "NeoForge"}) type.addItem(ty);
+        Check snaps = new Check(I18n.t("Показати знімки та давні версії"), false);
+        RamPick newRam = new RamPick(null);
+        newRam.setValueMb(0);
+        final boolean[] rebuild = {false};
         Combo<Engine.LV> lv = new Combo<>();
-        Combo<String> have = new Combo<>();
-        for (String id : installedLd) have.addItem(id);
         JLabel hint = label(" ", 12, false, Theme.MUTED);
-        for (JComponent c : new JComponent[]{name, mode, mc, type, lv, have}) {
-            c.setPreferredSize(new Dimension(340, 42));
-            c.setMaximumSize(new Dimension(Integer.MAX_VALUE, 42));
+        for (JComponent c : new JComponent[]{name, mc, lv}) {
+            c.setPreferredSize(new Dimension(200, 38));
+            c.setMaximumSize(new Dimension(Integer.MAX_VALUE, 38));
         }
-
-        JPanel manual = new JPanel();
-        manual.setOpaque(false);
-        manual.setLayout(new BoxLayout(manual, BoxLayout.Y_AXIS));
-        for (JComponent c : new JComponent[]{
-                label(I18n.t("Версія Minecraft"), 13, true, Theme.MUTED), mc,
-                label(" ", 6, false, Theme.MUTED),
-                label(I18n.t("Завантажувач"), 13, true, Theme.MUTED), type,
-                label(" ", 6, false, Theme.MUTED),
-                label(I18n.t("Версія завантажувача"), 13, true, Theme.MUTED), lv}) {
-            c.setAlignmentX(Component.LEFT_ALIGNMENT);
-            manual.add(c);
-        }
-        JPanel existing = new JPanel();
-        existing.setOpaque(false);
-        existing.setLayout(new BoxLayout(existing, BoxLayout.Y_AXIS));
-        JLabel hl = label(I18n.t("Встановлена версія"), 13, true, Theme.MUTED);
-        hl.setAlignmentX(Component.LEFT_ALIGNMENT);
-        have.setAlignmentX(Component.LEFT_ALIGNMENT);
-        existing.add(hl);
-        existing.add(have);
-        existing.add(Box.createVerticalGlue());
-        CardLayout modeCl = new CardLayout();
-        JPanel modeP = new JPanel(modeCl);
-        modeP.setOpaque(false);
-        modeP.add(manual, "manual");
-        modeP.add(existing, "have");
-        mode.addActionListener(e -> modeCl.show(modeP, mode.getSelectedIndex() == 0 ? "manual" : "have"));
+        final JLabel lvLabel = label(I18n.t("Версія завантажувача"), 13, true, Theme.MUTED);
+        final Btn[] okRef = {null};
+        // «Створити» активна лише коли версія завантажувача вже підвантажилась
+        Runnable gate = () -> {
+            Btn b = okRef[0];
+            if (b == null) return;
+            boolean ok;
+            if (sel[0].equals("Vanilla")) ok = mc.getSelectedItem() != null;
+            else ok = lv.getSelectedItem() instanceof Engine.LV;
+            b.setEnabled(ok);
+        };
 
         AtomicInteger seq = new AtomicInteger();
         Runnable loadLv = () -> {
-            Object mo = mc.getSelectedItem(), to = type.getSelectedItem();
+            Object mo = mc.getSelectedItem();
+            String to = sel[0];
             int my = seq.incrementAndGet();
             lv.removeAllItems();
-            if (mo == null || to == null) return;
-            prefetchMods((String) mo, Engine.detectLoader((String) to));
+            gate.run();
+            boolean van = to.equals("Vanilla");
+            lv.setEnabled(!van);
+            lvLabel.setText(van ? I18n.t("Версія завантажувача — не потрібна") : I18n.t("Версія завантажувача"));
+            if (mo == null) return;
+            if (van) { hint.setText(" "); return; }
+            prefetchMods((String) mo, Engine.detectLoader(to));
             hint.setText(I18n.t("Завантаження списку версій ") + to + "…");
             new Thread(() -> {
                 List<Engine.LV> list = null;
                 String err = null;
-                try { list = engine.loaderVersions((String) to, (String) mo); } catch (Exception ex) { err = ex.getMessage(); }
+                try { list = engine.loaderVersions(to, (String) mo); } catch (Exception ex) { err = ex.getMessage(); }
                 List<Engine.LV> res = list;
                 String er = err;
                 SwingUtilities.invokeLater(() -> {
@@ -2219,45 +3110,162 @@ final class LauncherWindow extends JFrame {
                             if (res.get(i).label().contains("recommended")) { lv.setSelectedIndex(i); break; }
                     }
                     hint.setText(er != null ? I18n.t("Не вдалося отримати список: ") + er
-                            : ok ? I18n.t("Доступно версій: ") + res.size() : to + I18n.t(" не підтримує Minecraft ") + mo);
+                            : ok ? " " : to + I18n.t(" не підтримує Minecraft ") + mo);
+                    gate.run();
                 });
             }, "profile-loader-versions").start();
         };
-        mc.addActionListener(e -> loadLv.run());
-        type.addActionListener(e -> loadLv.run());
-        loadLv.run();
+        Runnable fillMc = () -> {
+            rebuild[0] = true;
+            Object keep = mc.getSelectedItem();
+            mc.removeAllItems();
+            for (Engine.VInfo vi : engine.manifest) if (vi.type().equals("release") || snaps.isSelected()) mc.addItem(vi.id());
+            if (keep != null) mc.setSelectedItem(keep);
+            rebuild[0] = false;
+            loadLv.run();
+        };
+
+        JPanel tileRow = new JPanel(new GridLayout(1, LD.length, 8, 0));
+        tileRow.setOpaque(false);
+        for (String nm : LD) {
+            LoaderTile t = new LoaderTile(nm, () -> {
+                sel[0] = nm;
+                for (LoaderTile x : tileRowTiles(tileRow)) x.setSel(x.name.equals(nm));
+                loadLv.run();
+            });
+            t.setSel(nm.equals(sel[0]));
+            tileRow.add(t);
+        }
+
+        lv.addActionListener(e -> gate.run());
+        mc.addActionListener(e -> { if (!rebuild[0]) loadLv.run(); });
+        snaps.addActionListener(e -> fillMc.run());
+        fillMc.run();
+
+        // іконка збірки: превʼю + кнопка вибору поруч із назвою
+        final String[] iconId = {"cube"};
+        final BufferedImage[] iconImg = {null};
+        final JComponent[] prevRef = {null};
+        JComponent prev = new JComponent() {
+            boolean hov;
+            {
+                setPreferredSize(new Dimension(Theme.px(92), Theme.px(92)));
+                setMinimumSize(getPreferredSize());
+                setMaximumSize(getPreferredSize());
+                setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+                setToolTipText(I18n.t("Обрати іконку"));
+                addMouseListener(new MouseAdapter() {
+                    @Override public void mouseEntered(MouseEvent e) { hov = true; repaint(); }
+                    @Override public void mouseExited(MouseEvent e) { hov = false; repaint(); }
+                    @Override public void mouseClicked(MouseEvent e) { pickNewIcon(iconId, iconImg, prevRef[0]); }
+                });
+            }
+            @Override protected void paintComponent(Graphics g0) {
+                Graphics2D g = (Graphics2D) g0.create();
+                Theme.aa(g);
+                int s = Math.min(getWidth(), getHeight());
+                if (iconImg[0] != null) g.drawImage(BuildIcons.fit(iconImg[0], s * 2), 0, 0, s, s, null);
+                else BuildIcons.paint(g, iconId[0], 0, 0, s);
+                if (hov) {
+                    g.setColor(new Color(0, 0, 0, 90));
+                    g.fillRoundRect(0, 0, s, s, (int) (s * 0.46), (int) (s * 0.46));
+                    g.setColor(Color.WHITE);
+                    g.setFont(Theme.font(Font.BOLD, 11));
+                    String t = I18n.t("Змінити");
+                    FontMetrics fm = g.getFontMetrics();
+                    g.drawString(t, (s - fm.stringWidth(t)) / 2, s / 2 + fm.getAscent() / 2 - 2);
+                }
+                g.dispose();
+            }
+        };
+        prevRef[0] = prev;
+        Btn pickIcon = tiny(new Btn(I18n.t("Змінити іконку"), Btn.Kind.SECONDARY));
+        pickIcon.addActionListener(e -> pickNewIcon(iconId, iconImg, prev));
+        JPanel nameCol = new JPanel();
+        nameCol.setOpaque(false);
+        nameCol.setLayout(new BoxLayout(nameCol, BoxLayout.Y_AXIS));
+        JLabel nameLbl = label(I18n.t("Назва збірки"), 12, true, Theme.MUTED);
+        nameLbl.setAlignmentX(Component.LEFT_ALIGNMENT);
+        name.setAlignmentX(Component.LEFT_ALIGNMENT);
+        pickIcon.setAlignmentX(Component.LEFT_ALIGNMENT);
+        nameCol.add(nameLbl);
+        nameCol.add(Box.createVerticalStrut(5));
+        nameCol.add(name);
+        nameCol.add(Box.createVerticalStrut(8));
+        nameCol.add(pickIcon);
+        nameCol.add(Box.createVerticalGlue());
+        JPanel prevW = new JPanel(new BorderLayout());
+        prevW.setOpaque(false);
+        prevW.add(prev, BorderLayout.NORTH);
+        JPanel nameRow = new JPanel(new BorderLayout(14, 0));
+        nameRow.setOpaque(false);
+        nameRow.add(prevW, BorderLayout.WEST);
+        nameRow.add(nameCol, BorderLayout.CENTER);
+
+        JPanel mcCol = new JPanel();
+        mcCol.setOpaque(false);
+        mcCol.setLayout(new BoxLayout(mcCol, BoxLayout.Y_AXIS));
+        JLabel mcLbl = label(I18n.t("Версія Minecraft"), 12, true, Theme.MUTED);
+        lvLabel.setFont(Theme.font(Font.BOLD, 12));
+        for (JComponent c : new JComponent[]{mcLbl, mc}) {
+            c.setAlignmentX(Component.LEFT_ALIGNMENT);
+            mcCol.add(c);
+            if (c == mcLbl) mcCol.add(Box.createVerticalStrut(5));
+        }
+        JPanel lvCol = new JPanel();
+        lvCol.setOpaque(false);
+        lvCol.setLayout(new BoxLayout(lvCol, BoxLayout.Y_AXIS));
+        lvLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        lv.setAlignmentX(Component.LEFT_ALIGNMENT);
+        lvCol.add(lvLabel);
+        lvCol.add(Box.createVerticalStrut(5));
+        lvCol.add(lv);
+        lvCol.add(Box.createVerticalGlue());
+        JPanel vrow = new JPanel(new GridLayout(1, 2, 12, 0));
+        vrow.setOpaque(false);
+        vrow.add(mcCol);
+        vrow.add(lvCol);
 
         JPanel pn = new JPanel();
         pn.setOpaque(false);
         pn.setLayout(new BoxLayout(pn, BoxLayout.Y_AXIS));
-        for (JComponent c : new JComponent[]{
-                label(I18n.t("Назва збірки"), 13, true, Theme.MUTED), name,
+        JLabel ldLbl = label(I18n.t("Завантажувач"), 12, true, Theme.MUTED);
+        List<JComponent> parts = new ArrayList<>(List.of(
+                nameRow,
                 label(" ", 6, false, Theme.MUTED),
-                label(I18n.t("Звідки взяти версію"), 13, true, Theme.MUTED), mode,
+                ldLbl, tileRow,
                 label(" ", 6, false, Theme.MUTED),
-                modeP,
-                label(" ", 6, false, Theme.MUTED), hint}) {
+                vrow,
+                snaps,
+                label(" ", 6, false, Theme.MUTED),
+                label(I18n.t("Виділена пам'ять (ОЗП)"), 12, true, Theme.MUTED),
+                newRam,
+                hint));
+        for (JComponent c : parts) {
             c.setAlignmentX(Component.LEFT_ALIGNMENT);
             pn.add(c);
         }
-        if (!Dlg.show(this, I18n.t("Нова збірка"), pn, I18n.t("Створити"), I18n.t("Скасувати"))) { seq.incrementAndGet(); return; }
+        pn.setPreferredSize(new Dimension(Theme.px(460), pn.getPreferredSize().height));
+        if (!Dlg.show(this, I18n.t("Нова збірка"), pn, I18n.t("Створити збірку"), I18n.t("Скасувати"), null,
+                b -> { okRef[0] = b; gate.run(); })) { seq.incrementAndGet(); return; }
         seq.incrementAndGet();
+        final int newRamMb = newRam.valueMb();
         String n = name.getText().trim();
         if (!n.matches("[\\p{L}\\p{N}][\\p{L}\\p{N} _.-]{0,31}")) {
             msg(I18n.t("Назва: до 32 символів — літери, цифри, пробіл, _ - ."));
             return;
         }
         if (Files.exists(instDir(n))) { msg(I18n.t("Збірка з такою назвою вже є.")); return; }
-        boolean fresh = mode.getSelectedIndex() == 0;
-        String mcv = (String) mc.getSelectedItem(), ldType = (String) type.getSelectedItem();
+        String mcv = (String) mc.getSelectedItem(), ldType = sel[0];
+        final boolean vanilla = ldType.equals("Vanilla");
         Object lo = lv.getSelectedItem();
-        String haveId = (String) have.getSelectedItem();
-        if (fresh && (mcv == null || ldType == null || !(lo instanceof Engine.LV))) {
+        if (mcv == null || (!vanilla && !(lo instanceof Engine.LV))) {
             msg(I18n.t("Обери версію Minecraft, завантажувач і його версію."));
             return;
         }
-        if (!fresh && haveId == null) { msg(I18n.t("Обери встановлену версію.")); return; }
-        String ldVer = fresh ? ((Engine.LV) lo).version() : null;
+        String ldVer = !vanilla ? ((Engine.LV) lo).version() : null;
+        final String chosenIcon = iconImg[0] != null ? null : iconId[0];
+        final BufferedImage chosenImg = iconImg[0];
         String java = javaPath();
         final Set<String> before = new HashSet<>(engine.installedIds());
         setBusy(true);
@@ -2265,14 +3273,15 @@ final class LauncherWindow extends JFrame {
         engine.stop = false;
         cancelUi(true, pCancel, pPause);
         Engine.Progress pg = (tx, fr) -> SwingUtilities.invokeLater(() -> { mStatus.setText(tx); mBar.set(fr); });
-        if (fresh) prefetchMods(mcv, Engine.detectLoader(ldType));
+        if (!vanilla) prefetchMods(mcv, Engine.detectLoader(ldType));
         new Thread(() -> {
             try {
                 String vid;
-                if (fresh) {
+                if (vanilla) vid = mcv;
+                else {
                     vid = installLoaderEnsured(ldType, mcv, ldVer, java, pg);
                     log(I18n.t("Встановлено: ") + vid);
-                } else vid = haveId;
+                }
                 Map<String, Object> v = engine.loadVersion(vid);
                 String jar = Json.string(v.get("_jar"));
                 String mcId = jar != null ? jar : vid;
@@ -2284,10 +3293,12 @@ final class LauncherWindow extends JFrame {
                 pr.setProperty("version", vid);
                 pr.setProperty("mc", mcId);
                 pr.setProperty("loader", loader);
-                if (fresh && !before.contains(vid)) pr.setProperty("hide", vid);
+                if (newRamMb >= 512) pr.setProperty("ram", String.valueOf(newRamMb));
+                if (!vanilla && !before.contains(vid)) pr.setProperty("hide", vid);
                 try (Writer w = Files.newBufferedWriter(d.resolve("profile.properties"), StandardCharsets.UTF_8)) {
                     pr.store(w, "PaxLauncher profile");
                 }
+                try { BuildIcons.save(d, chosenIcon, chosenImg); } catch (IOException ie) { log(I18n.t("Не вдалося зберегти іконку: ") + ie.getMessage()); }
                 log(I18n.t("Створено збірку «") + n + "» (" + loader + " " + mcId + ")");
                 SwingUtilities.invokeLater(() -> {
                     refreshProfiles(n);
@@ -2312,9 +3323,597 @@ final class LauncherWindow extends JFrame {
         }, "profile-create").start();
     }
 
-    void deleteProfile() {
+    /** Діалог вибору іконки для нової збірки; результат кладе в масиви (id або власна картинка). */
+    void pickNewIcon(String[] id, BufferedImage[] img, JComponent repaintMe) {
+        IconPicker ip = new IconPicker(id[0], img[0], this, "cube");
+        if (!Dlg.show(this, I18n.t("Іконка збірки"), ip, I18n.t("Обрати"), I18n.t("Скасувати"))) return;
+        id[0] = ip.id();
+        img[0] = ip.custom();
+        if (repaintMe != null) repaintMe.repaint();
+    }
+
+    /** Завантажує модпак з Modrinth / CurseForge у ВЖЕ ІСНУЮЧУ збірку: нової збірки не створює й завантажувач не ставить. */
+    Path packRegistry(Prof p) { return instDir(p.name()).resolve(".pax-modpacks.properties"); }
+
+    boolean isPackInstalled(Prof p, ModApi.Hit h) {
+        if (p == null || h == null) return false;
+        Properties pr = new Properties();
+        try (Reader r = Files.newBufferedReader(packRegistry(p), StandardCharsets.UTF_8)) { pr.load(r); } catch (IOException e) { return false; }
+        return pr.getProperty(h.id()) != null;
+    }
+
+    void rememberPack(Prof p, ModApi.Hit h) { rememberPack(p, h.id(), h.title()); }
+
+    void rememberPack(Prof p, String id, String title) {
+        Properties pr = new Properties();
+        Path f = packRegistry(p);
+        try (Reader r = Files.newBufferedReader(f, StandardCharsets.UTF_8)) { pr.load(r); } catch (IOException ignored) { }
+        pr.setProperty(id, title);
+        try (Writer w = Files.newBufferedWriter(f, StandardCharsets.UTF_8)) { pr.store(w, "PaxLauncher modpacks"); } catch (IOException ignored) { }
+    }
+
+    /** Для збірки модів, яку вже встановлено у вибрану збірку: кнопка «Встановлено» + «Керувати збіркою модів». */
+    void updatePackState() {
+        ModApi.Hit h = mList.getSelectedValue();
+        boolean inst = h != null && h.kind().isPack() && isPackInstalled(curProf(), h);
+        packInstalledNow = inst;
+        if (inst) {
+            mInstall.setText(I18n.t("Встановлено"));
+            mInstall.setEnabled(false);
+        } else if (h != null && h.kind().isPack()) {
+            Object o = mFiles.getSelectedItem();
+            mInstall.setText(o instanceof ModApi.ModFile && ((ModApi.ModFile) o).url() == null ? I18n.t("Відкрити на сайті") : I18n.t("Встановити"));
+        }
+    }
+
+    String savedQuery = "";
+
+    /** Єдина кнопка «Керувати збіркою»: перемикає між пошуком і редагуванням встановленого (категорію обирають зверху). */
+    boolean manageFromLib;
+
+    void openPackManager() {
+        if (curProf() == null) return;
+        if (mInstalledView && manageFromLib) {
+            manageFromLib = false;
+            showInstalledView(false);
+            showPage("library");
+            return;
+        }
+        showInstalledView(!mInstalledView);
+    }
+
+    interface PlanOpener { Modpacks.Plan open(Modpacks packs, Engine.Progress pOpen) throws Exception; }
+
+    void installPackInto(Prof prof, ModApi.Hit hit, ModApi.ModFile file) {
+        runPackInstall(prof, hit.id(), hit.title(), (packs, pOpen) ->
+                packs.open(CurseForge.isCf(hit.id()), hit.title(), hit.pageUrl(), file, pOpen, () -> engine.stop));
+    }
+
+    /** Імпорт збірки модів із файлу на диску (.mrpack Modrinth або .zip CurseForge) у ВЖЕ ІСНУЮЧУ збірку. */
+    void importModpackFile(Prof prof) {
+        if (prof == null) { msg(I18n.t("Спочатку створи збірку.")); return; }
+        if (busy || mBusy) { msg(I18n.t("Зачекай, поки завершиться завантаження.")); return; }
+        File[] f = FilePick.show(this, I18n.t("Обери файл збірки модів (.mrpack або .zip)"), JFileChooser.FILES_ONLY, false, null);
+        if (f == null || f.length == 0) return;
+        Path src = f[0].toPath();
+        String fn = src.getFileName().toString();
+        String low = fn.toLowerCase(Locale.ROOT);
+        if (!low.endsWith(".mrpack") && !low.endsWith(".zip")) { msg(I18n.t("Потрібен файл збірки модів: .mrpack (Modrinth) або .zip (CurseForge).")); return; }
+        String base = fn.replaceAll("(?i)\\.(mrpack|zip)$", "");
+        runPackInstall(prof, "local:" + base, base, (packs, pOpen) -> packs.openLocal(src, base, pOpen));
+    }
+
+    void libProgress(String tx, double fr) {
+        if (!libBuilt) return;
+        libBar.set(fr);
+        libBar.setVisible(true);
+    }
+
+    void libProgressEnd() {
+        if (!libBuilt) return;
+        libBar.set(0);
+        libBar.setVisible(false);
+        refreshLibrary();
+    }
+
+    void runPackInstall(Prof prof, String packId, String packTitle, PlanOpener opener) {
+        final Modpacks packs = new Modpacks(api);
+        final Path d = instDir(prof.name());
+        setBusy(true);
+        mBusy = true;
+        mInstall.setEnabled(false);
+        mBar.set(0.02);
+        engine.stop = false;
+        cancelUi(true, pCancel, pPause);
+        Engine.Progress pg = (tx, fr) -> SwingUtilities.invokeLater(() -> { mStatus.setText(tx); mBar.set(fr); libProgress(tx, fr); });
+        Engine.Progress pOpen = (tx, fr) -> pg.update(tx, 0.02 + 0.18 * fr);
+        Engine.Progress pFiles = (tx, fr) -> pg.update(tx, 0.20 + 0.77 * fr);
+        new Thread(() -> {
+            final Path[] arc = {null};
+            try {
+                final Modpacks.Plan fplan = opener.open(packs, pOpen);
+                arc[0] = fplan.archive();
+                if (!Modpacks.sameLoader(fplan.loader(), prof.loader()))
+                    throw new IOException(I18n.t("Ця збірка модів зроблена для завантажувача ") + fplan.loader()
+                            + I18n.t(", а твоя збірка «") + prof.name() + I18n.t("» — на ") + prof.loader()
+                            + I18n.t(". Моди не запрацюють, тому нічого не змінено."));
+                if (!fplan.mc().equals(prof.mc()))
+                    log(I18n.t("Увага: збірка модів для Minecraft ") + fplan.mc() + I18n.t(", а збірка «") + prof.name() + I18n.t("» — на ") + prof.mc());
+                Files.createDirectories(d.resolve("mods"));
+                final Set<String> filesBefore = PackStore.snapshot(d);
+                Modpacks.Report rep = packs.install(fplan, d, pFiles, () -> engine.stop);
+                PackStore.record(d, packId, filesBefore, PackStore.snapshot(d));
+                rememberPack(prof, packId, packId.startsWith("local:") && !fplan.name().isEmpty() ? fplan.name() : packTitle);
+                log(I18n.t("Збірку модів «") + fplan.name() + I18n.t("» встановлено у збірку «") + prof.name() + "»");
+                for (String s : rep.failed()) log(I18n.t("Не вдалося завантажити: ") + s);
+                for (String s : rep.manual()) log(I18n.t("Потрібно завантажити вручну: ") + s);
+                SwingUtilities.invokeLater(() -> {
+                    mBar.set(0);
+                    mStatus.setText(I18n.t("Збірку модів «") + fplan.name() + I18n.t("» встановлено у збірку «") + prof.name() + "»");
+                    status.setText(" ");
+                    if (!rep.clean()) {
+                        msg(I18n.t("Збірка модів встановлена, але не всі файли вдалося отримати: ") + (rep.failed().size() + rep.manual().size())
+                                + I18n.t(" з ") + rep.total() + ".\n"
+                                + I18n.t("Список файлів і посилання на них збережено у файлі PaxLauncher-missing-mods.txt в папці збірки:\n") + d);
+                    } else if (packId.startsWith("local:")) {
+                        msg(I18n.t("Збірку модів «") + fplan.name() + I18n.t("» встановлено у збірку «") + prof.name() + "»");
+                    }
+                });
+            } catch (Engine.Cancelled cx) {
+                log(I18n.t("Встановлення збірки модів скасовано"));
+                SwingUtilities.invokeLater(() -> { mBar.set(0); mStatus.setText(I18n.t("Завантаження скасовано")); });
+            } catch (Exception ex) {
+                log(I18n.t("Помилка встановлення збірки модів: ") + ex);
+                SwingUtilities.invokeLater(() -> {
+                    mBar.set(0);
+                    mStatus.setText(I18n.t("Не вдалося встановити збірку модів"));
+                    msg(I18n.t("Не вдалося встановити збірку модів:\n") + ex.getMessage());
+                });
+            } finally {
+                if (arc[0] != null) { try { Files.deleteIfExists(arc[0]); } catch (IOException ignored) { } }
+                SwingUtilities.invokeLater(() -> {
+                    mBusy = false;
+                    setBusy(false);
+                    cancelUi(false, pCancel, pPause);
+                    mInstall.setEnabled(mFiles.getItemCount() > 0);
+                    updatePackState();
+                    libProgressEnd();
+                });
+            }
+        }, "pack-install").start();
+    }
+
+    record PackEnt(String id, String title, int files) {
+        @Override public String toString() {
+            return title + "   ·   " + (files < 0 ? I18n.t("список файлів невідомий") : files + I18n.t(" файлів"));
+        }
+    }
+
+    List<PackEnt> installedPacks(Prof p) {
+        List<PackEnt> r = new ArrayList<>();
+        if (p == null) return r;
+        Properties pr = new Properties();
+        try (Reader rd = Files.newBufferedReader(packRegistry(p), StandardCharsets.UTF_8)) { pr.load(rd); } catch (IOException e) { return r; }
+        Path d = instDir(p.name());
+        for (String id : new TreeSet<>(pr.stringPropertyNames())) r.add(new PackEnt(id, pr.getProperty(id), PackStore.count(d, id)));
+        return r;
+    }
+
+    final DefaultListModel<PackEnt> pkModel = new DefaultListModel<>();
+    final JList<PackEnt> pkList = emptyAware(pkModel);
+    final Btn pkRm = new Btn(I18n.t("Видалити збірку модів"), Btn.Kind.SECONDARY);
+    final JLabel pkEmpty = label(" ", 14, false, Theme.MUTED);
+
+    /** Вигляд «Збірки модів» у керуванні збіркою: список поставлених у цю збірку збірок модів. */
+    JPanel packsView() {
+        pkList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        pkList.setBackground(Theme.CARD2);
+        pkList.setForeground(Theme.TEXT);
+        pkList.setSelectionBackground(Theme.acc(70));
+        pkList.setSelectionForeground(Theme.TEXT);
+        pkList.setFont(Theme.font(Font.PLAIN, 15));
+        pkList.setFixedCellHeight(46);
+        pkList.setBorder(new EmptyBorder(4, 10, 4, 10));
+        JScrollPane sp = new JScrollPane(pkList); Smooth.install(sp);
+        sp.setBorder(null);
+        sp.getViewport().setBackground(Theme.CARD2);
+        sp.getVerticalScrollBar().setUI(new SlimScrollBarUI());
+        sp.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        small(pkRm);
+        pkRm.addActionListener(e -> removePackEntry(curProf(), pkList.getSelectedValue()));
+        pkList.addListSelectionListener(e -> pkRm.setEnabled(pkList.getSelectedValue() != null));
+        JLabel title = label(I18n.t("Встановлені збірки модів"), 15, true, Theme.TEXT);
+        JPanel head = new JPanel(new BorderLayout(10, 0));
+        head.setOpaque(false);
+        head.add(title, BorderLayout.WEST);
+        head.add(pkEmpty, BorderLayout.CENTER);
+        pkEmpty.setHorizontalAlignment(SwingConstants.RIGHT);
+        JPanel foot = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        foot.setOpaque(false);
+        foot.add(pkRm);
+        JPanel v = new JPanel(new BorderLayout(0, 12));
+        v.setOpaque(false);
+        v.add(sp, BorderLayout.CENTER);
+        v.add(foot, BorderLayout.SOUTH);
+        return v;
+    }
+
+    void refreshPackList() {
         Prof p = curProf();
+        PackEnt keep = pkList.getSelectedValue();
+        pkModel.clear();
+        List<PackEnt> list = installedPacks(p);
+        for (PackEnt e : list) pkModel.addElement(e);
+        pkEmpty.setText(" ");
+        if (!list.isEmpty()) {
+            int idx = 0;
+            for (int i = 0; i < list.size(); i++) if (keep != null && list.get(i).id().equals(keep.id())) idx = i;
+            pkList.setSelectedIndex(idx);
+        }
+        pkRm.setEnabled(!list.isEmpty());
+    }
+
+    void removePackEntry(Prof p, PackEnt e) {
+        if (p == null || e == null) return;
+        if (busy || mBusy) { msg(I18n.t("Зачекай, поки завершиться завантаження.")); return; }
+        Path d = instDir(p.name());
+        boolean legacy = e.files() < 0;
+        String q = legacy
+                ? I18n.t("Збірку модів «") + e.title() + I18n.t("» поставила стара версія запускача — списку її файлів немає, тому точно прибрати лише її не вийде.\nБуде очищено папки mods, config, defaultconfigs, kubejs, scripts, resourcepacks і shaderpacks у збірці «") + p.name()
+                + I18n.t("» (разом з модами, які ти додав вручну). Світи, options.txt та інші файли залишаться.\nПродовжити?")
+                : I18n.t("Видалити збірку модів «") + e.title() + I18n.t("» зі збірки «") + p.name() + I18n.t("»?\nБуде видалено файлів: ") + e.files();
+        if (!Dlg.show(this, I18n.t("Видалити збірку модів"), Dlg.text(q), legacy ? I18n.t("Очистити й видалити") : I18n.t("Видалити"), I18n.t("Скасувати"))) return;
+        int n = 0;
+        try { n = legacy ? PackStore.wipe(d) : PackStore.remove(d, e.id()); }
+        catch (IOException ex) { msg(I18n.t("Не вдалося видалити файли: ") + ex.getMessage()); return; }
+        Properties pr = new Properties();
+        Path f = packRegistry(p);
+        try (Reader r = Files.newBufferedReader(f, StandardCharsets.UTF_8)) { pr.load(r); } catch (IOException ignored) { }
+        pr.remove(e.id());
+        try (Writer w = Files.newBufferedWriter(f, StandardCharsets.UTF_8)) { pr.store(w, "PaxLauncher modpacks"); } catch (IOException ignored) { }
+        PackStore.forget(d, e.id());
+        log(I18n.t("Збірку модів «") + e.title() + I18n.t("» видалено зі збірки «") + p.name() + I18n.t("»: файлів ") + n);
+        mStatus.setText(I18n.t("Збірку модів «") + e.title() + I18n.t("» видалено (файлів: ") + n + ")");
+        updatePackState();
+        refreshPackList();
+        refreshLibrary();
+    }
+
+    boolean kindChosen0() { return mKind.getSelectedItem() instanceof ModApi.Kind; }
+
+    // ---------- Бібліотека збірок ----------
+
+    final JPanel libGrid = new JPanel(new WrapGrid(330, 208, 14));
+    final JLabel libInfo = label(" ", 13, false, Theme.MUTED);
+    final Field libQuery = new Field("");
+    final Bar libBar = new Bar();
+    final JLabel libEmpty = label(" ", 15, false, Theme.MUTED);
+    final JLabel libCount = label(" ", 13, false, Theme.MUTED);
+    final List<Prof> libProfs = new ArrayList<>();
+    final List<JComponent> libCards = new ArrayList<>();
+    boolean libBuilt;
+
+    /** Яскравий блок угорі бібліотеки: головна точка входу в створення збірки. */
+    JComponent libHero() {
+        JPanel hero = new JPanel(new BorderLayout(18, 0)) {
+            @Override protected void paintComponent(Graphics g0) {
+                Graphics2D g = (Graphics2D) g0.create();
+                Theme.aa(g);
+                int w = getWidth(), h = getHeight();
+                RoundRectangle2D rr = new RoundRectangle2D.Float(0, 0, w, h, 20, 20);
+                g.setColor(Theme.CARD);
+                g.fill(rr);
+                g.setPaint(new GradientPaint(0, 0, Theme.acc(104), w, h, Theme.acc(16)));
+                g.fill(rr);
+                Shape old = g.getClip();
+                g.clip(rr);
+                g.setColor(Theme.acc(28));
+                g.fillOval(w - 190, -70, 230, 230);
+                g.setColor(Theme.acc(20));
+                g.fillOval(w - 100, h - 60, 150, 150);
+                g.fillOval(w - 330, h - 34, 70, 70);
+                g.setClip(old);
+                g.setColor(Theme.acc(110));
+                g.setStroke(new BasicStroke(1.3f));
+                g.draw(new RoundRectangle2D.Float(0.65f, 0.65f, w - 1.3f, h - 1.3f, 20, 20));
+                g.dispose();
+            }
+        };
+        hero.setOpaque(false);
+        hero.setBorder(new EmptyBorder(14, 20, 14, 20));
+
+        JComponent badge = new JComponent() {
+            @Override protected void paintComponent(Graphics g0) {
+                Graphics2D g = (Graphics2D) g0.create();
+                Theme.aa(g);
+                int s = Math.min(getWidth(), getHeight());
+                g.setPaint(new GradientPaint(0, 0, Theme.ACC_HI, s, s, Theme.ACC1));
+                g.fillRoundRect(0, 0, s, s, s * 3 / 8, s * 3 / 8);
+                g.setColor(Theme.ACC_ON);
+                g.setStroke(new BasicStroke(Math.max(3f, s / 11f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                int c = s / 2, r = s / 5;
+                g.drawLine(c - r, c, c + r, c);
+                g.drawLine(c, c - r, c, c + r);
+                g.dispose();
+            }
+        };
+        badge.setPreferredSize(new Dimension(48, 48));
+        JPanel badgeW = new JPanel(new GridBagLayout());
+        badgeW.setOpaque(false);
+        badgeW.add(badge);
+        hero.add(badgeW, BorderLayout.WEST);
+
+        JPanel txt = new JPanel();
+        txt.setOpaque(false);
+        txt.setLayout(new BoxLayout(txt, BoxLayout.Y_AXIS));
+        JLabel a = label(I18n.t("Створи нову збірку"), 18, true, Theme.TEXT);
+        JLabel b = label(I18n.t("Окрема копія гри зі своїми модами, світами та власною іконкою."), 13, false, Theme.SUB);
+        a.setAlignmentX(Component.LEFT_ALIGNMENT);
+        b.setAlignmentX(Component.LEFT_ALIGNMENT);
+        txt.add(Box.createVerticalGlue());
+        txt.add(a);
+        txt.add(Box.createVerticalStrut(4));
+        txt.add(b);
+        txt.add(Box.createVerticalGlue());
+        hero.add(txt, BorderLayout.CENTER);
+
+        Btn mk = small(new Btn(I18n.t("Створити збірку"), Btn.Kind.PRIMARY));
+        mk.setFont(Theme.bfont(Font.BOLD, 14));
+        mk.setPlus(true);
+        mk.setPreferredSize(new Dimension(200, 42));
+        mk.addActionListener(e -> newProfile());
+        JPanel bw = new JPanel(new GridBagLayout());
+        bw.setOpaque(false);
+        bw.add(mk);
+        hero.add(bw, BorderLayout.EAST);
+        return hero;
+    }
+
+    JPanel libraryPage() {
+        JPanel p = new JPanel(new BorderLayout(0, 6));
+        p.setOpaque(false);
+        p.setBorder(new EmptyBorder(24, 28, 22, 28));
+        JPanel head = new JPanel();
+        head.setOpaque(false);
+        head.setLayout(new BoxLayout(head, BoxLayout.Y_AXIS));
+        JLabel t = label(I18n.t("Бібліотека збірок"), 25, true, Theme.TEXT);
+        // кількість збірок — просто число праворуч від заголовка, без тексту
+        libInfo.setFont(Theme.font(Font.PLAIN, 13));
+        JPanel titleRow = new JPanel(new BorderLayout(10, 0));
+        titleRow.setOpaque(false);
+        titleRow.add(t, BorderLayout.WEST);
+        JPanel cntW = new JPanel(new GridBagLayout());
+        cntW.setOpaque(false);
+        cntW.add(libInfo);
+        titleRow.add(cntW, BorderLayout.EAST);
+        titleRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+        titleRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
+        head.add(titleRow);
+        head.add(Box.createVerticalStrut(10));
+        JComponent hero = libHero();
+        hero.setAlignmentX(Component.LEFT_ALIGNMENT);
+        head.add(hero);
+        head.add(Box.createVerticalStrut(10));
+
+        libQuery.setHint(I18n.t("Пошук збірки"));
+        libQuery.setPreferredSize(new Dimension(300, 40));
+        Btn clr = tiny(new Btn(I18n.t("Очистити"), Btn.Kind.GHOST));
+        clr.setVisible(false);
+        clr.addActionListener(e -> { libQuery.setText(""); libQuery.requestFocusInWindow(); });
+        // кнопка «Очистити» живе всередині поля пошуку, праворуч; з'являється, коли є що очищати
+        libQuery.setBorder(new EmptyBorder(11, 14, 11, Theme.px(96)));
+        libQuery.setLayout(new LayoutManager() {
+            @Override public void addLayoutComponent(String n, Component c) { }
+            @Override public void removeLayoutComponent(Component c) { }
+            @Override public Dimension preferredLayoutSize(Container c) { return new Dimension(0, 0); }
+            @Override public Dimension minimumLayoutSize(Container c) { return new Dimension(0, 0); }
+            @Override public void layoutContainer(Container c) {
+                Dimension d = clr.getPreferredSize();
+                clr.setBounds(c.getWidth() - d.width - 6, (c.getHeight() - d.height) / 2, d.width, d.height);
+            }
+        });
+        libQuery.add(clr);
+        libQuery.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            void ch() { clr.setVisible(!libQuery.getText().isEmpty()); applyLibFilter(); }
+            @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { ch(); }
+            @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { ch(); }
+            @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { ch(); }
+        });
+        JPanel sr = new JPanel(new BorderLayout());
+        sr.setOpaque(false);
+        sr.add(libQuery, BorderLayout.CENTER);
+        sr.setAlignmentX(Component.LEFT_ALIGNMENT);
+        sr.setMaximumSize(new Dimension(Integer.MAX_VALUE, 42));
+        head.add(sr);
+        libBar.setPreferredSize(new Dimension(100, 6));
+        libBar.setMaximumSize(new Dimension(Integer.MAX_VALUE, 6));
+        libBar.setVisible(false);
+        libBar.setAlignmentX(Component.LEFT_ALIGNMENT);
+        head.add(Box.createVerticalStrut(4));
+        head.add(libBar);
+        p.add(head, BorderLayout.NORTH);
+
+        libGrid.setOpaque(false);
+        libEmpty.setBorder(new EmptyBorder(4, 2, 0, 0));
+        VPanel body = new VPanel();
+        body.row(libGrid, 0);
+        body.row(libEmpty, 6);
+        body.end();
+        p.add(vscroll(body, Theme.BG2), BorderLayout.CENTER);
+        libBuilt = true;
+        refreshLibrary();
+        return p;
+    }
+
+    /** Кругла кнопка-іконка збірки на картці: клік відкриває вибір іконки. */
+    JComponent libIcon(Prof pf, Path d) {
+        final int px = Theme.px(64);
+        final BufferedImage im = BuildIcons.load(d, px * 2);
+        JComponent c = new JComponent() {
+            boolean hov;
+            {
+                setPreferredSize(new Dimension(px, px));
+                setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+                setToolTipText(I18n.t("Змінити іконку"));
+                addMouseListener(new MouseAdapter() {
+                    @Override public void mouseEntered(MouseEvent e) { hov = true; repaint(); }
+                    @Override public void mouseExited(MouseEvent e) { hov = false; repaint(); }
+                    @Override public void mouseClicked(MouseEvent e) { changeIcon(pf); }
+                });
+            }
+            @Override protected void paintComponent(Graphics g0) {
+                Graphics2D g = (Graphics2D) g0.create();
+                Theme.aa(g);
+                g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+                int s = Math.min(getWidth(), getHeight());
+                g.drawImage(im, 0, 0, s, s, null);
+                if (hov) {
+                    g.setColor(new Color(0, 0, 0, 90));
+                    g.fillRoundRect(0, 0, s, s, (int) (s * 0.46), (int) (s * 0.46));
+                    g.setColor(Color.WHITE);
+                    g.setStroke(new BasicStroke(Math.max(2f, s / 24f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                    int cx = s / 2, cy = s / 2, r = s / 6;
+                    g.drawLine(cx - r, cy + r, cx + r, cy - r);
+                    g.drawLine(cx - r, cy + r, cx - r, cy + r - s / 12);
+                    g.drawLine(cx - r, cy + r, cx - r + s / 12, cy + r);
+                }
+                g.dispose();
+            }
+        };
+        return c;
+    }
+
+    void changeIcon(Prof pf) {
+        Path d = instDir(pf.name());
+        String cur = BuildIcons.choice(d);
+        BufferedImage custom = null;
+        if (BuildIcons.CUSTOM.equals(cur)) {
+            try { custom = javax.imageio.ImageIO.read(d.resolve("icon.png").toFile()); } catch (IOException ignored) { }
+        }
+        String dflt = BuildIcons.defaultId(pf.name());
+        IconPicker ip = new IconPicker(BuildIcons.valid(cur) ? cur : dflt, custom, this, dflt);
+        if (!Dlg.show(this, I18n.t("Іконка збірки «") + pf.name() + "»", ip, I18n.t("Зберегти"), I18n.t("Скасувати"))) return;
+        try { BuildIcons.save(d, ip.id(), ip.custom()); }
+        catch (IOException ex) { msg(I18n.t("Не вдалося зберегти іконку: ") + ex.getMessage()); return; }
+        refreshLibrary();
+    }
+
+    JComponent libCard(Prof pf) {
+        Path d = instDir(pf.name());
+        int mods = 0;
+        try (var st = Files.list(d.resolve("mods"))) {
+            mods = (int) st.filter(x -> { String n = x.getFileName().toString(); return n.endsWith(".jar") || n.endsWith(".jar.disabled"); }).count();
+        } catch (IOException ignored) { }
+        int packs = installedPacks(pf).size();
+
+        Card c = new Card(new BorderLayout(0, 12), 14);
+        JLabel name = label(pf.name(), 18, true, Theme.TEXT);
+        JLabel sub = label(pf.loader() + "  ·  Minecraft " + pf.mc(), 13, false, Theme.MUTED);
+        JPanel top = new JPanel();
+        top.setOpaque(false);
+        top.setLayout(new BoxLayout(top, BoxLayout.Y_AXIS));
+        name.setAlignmentX(Component.LEFT_ALIGNMENT);
+        sub.setAlignmentX(Component.LEFT_ALIGNMENT);
+        JLabel stat = label(I18n.t("Модів: ") + mods + I18n.t("   ·   збірок модів: ") + packs, 13, true, Theme.TEXT);
+        stat.setAlignmentX(Component.LEFT_ALIGNMENT);
+        top.add(Box.createVerticalGlue());
+        top.add(name);
+        top.add(Box.createVerticalStrut(2));
+        top.add(sub);
+        top.add(Box.createVerticalStrut(4));
+        top.add(stat);
+        top.add(Box.createVerticalGlue());
+        JPanel head = new JPanel(new BorderLayout(14, 0));
+        head.setOpaque(false);
+        JPanel icW = new JPanel(new BorderLayout());
+        icW.setOpaque(false);
+        icW.setBorder(new EmptyBorder(Theme.px(6), 0, 0, 0));
+        icW.add(libIcon(pf, d), BorderLayout.CENTER);
+        head.add(icW, BorderLayout.WEST);
+        head.add(top, BorderLayout.CENTER);
+        c.add(head, BorderLayout.CENTER);
+
+        Btn play = small(new Btn(I18n.t("Грати"), Btn.Kind.PRIMARY));
+        Btn manage = small(new Btn(I18n.t("Керувати"), Btn.Kind.SECONDARY));
+        Btn dir = small(new Btn(I18n.t("Папка"), Btn.Kind.SECONDARY));
+        Btn imp = small(new Btn(I18n.t("Імпорт"), Btn.Kind.SECONDARY));
+        Btn ico = small(new Btn(I18n.t("Іконка"), Btn.Kind.SECONDARY));
+        Btn del = small(new Btn(I18n.t("Видалити"), Btn.Kind.GHOST));
+        play.addActionListener(e -> {
+            fillVersions("profile:" + pf.name());
+            showPage("play");
+            play();
+        });
+        manage.addActionListener(e -> {
+            modsInit = true;
+            refreshProfiles(pf.name());
+            showInstalledView(true);
+            showPage("mods");
+            manageFromLib = true;
+        });
+        dir.addActionListener(e -> openFolder(d));
+        imp.addActionListener(e -> importChooser(pf));
+        ico.addActionListener(e -> changeIcon(pf));
+        del.addActionListener(e -> deleteProfile(pf));
+        JPanel r1 = new JPanel(new GridLayout(1, 3, 8, 0));
+        r1.setOpaque(false);
+        r1.add(play);
+        r1.add(manage);
+        r1.add(dir);
+        JPanel r2 = new JPanel(new GridLayout(1, 3, 8, 0));
+        r2.setOpaque(false);
+        r2.add(imp);
+        r2.add(ico);
+        r2.add(del);
+        JPanel bt = new JPanel(new GridLayout(2, 1, 0, 8));
+        bt.setOpaque(false);
+        bt.add(r1);
+        bt.add(r2);
+        c.add(bt, BorderLayout.SOUTH);
+        return c;
+    }
+
+    /** Перебудовує картки збірок з диска (після створення / видалення / імпорту) і застосовує пошук. */
+    void refreshLibrary() {
+        if (!libBuilt) return;
+        libProfs.clear();
+        libCards.clear();
+        for (Prof pf : loadProfiles()) {
+            libProfs.add(pf);
+            libCards.add(libCard(pf));
+        }
+        applyLibFilter();
+    }
+
+    /** Показує лише ті збірки, що підходять під пошуковий запит (за назвою, завантажувачем і версією гри). */
+    void applyLibFilter() {
+        if (!libBuilt) return;
+        String q = libQuery.getText().trim().toLowerCase(Locale.ROOT);
+        String[] words = q.isEmpty() ? new String[0] : q.split("\\s+");
+        libGrid.removeAll();
+        int shown = 0;
+        for (int i = 0; i < libProfs.size(); i++) {
+            Prof pf = libProfs.get(i);
+            String hay = (pf.name() + " " + pf.loader() + " " + pf.mc() + " " + pf.versionId()).toLowerCase(Locale.ROOT);
+            boolean ok = true;
+            for (String w : words) if (!hay.contains(w)) { ok = false; break; }
+            if (ok) { libGrid.add(libCards.get(i)); shown++; }
+        }
+        int total = libProfs.size();
+        libInfo.setText(total == 0 ? " " : q.isEmpty() ? String.valueOf(total) : shown + " / " + total);
+        libCount.setText(" ");
+        libEmpty.setText(total == 0 ? I18n.t("У бібліотеці ще немає збірок — натисни «Створити збірку» вгорі.")
+                : shown == 0 ? I18n.t("За запитом «") + libQuery.getText().trim() + I18n.t("» нічого не знайдено.") : " ");
+        libEmpty.setVisible(shown == 0);
+        libGrid.setVisible(shown > 0);
+        libGrid.revalidate();
+        libGrid.repaint();
+        if (libEmpty.getParent() != null) libEmpty.getParent().revalidate();
+    }
+
+    void deleteProfile(Prof p) {
         if (p == null) return;
+        if (busy || mBusy) { msg(I18n.t("Зачекай, поки завершиться завантаження.")); return; }
         Path dir = instDir(p.name());
         if (!Dlg.show(this, I18n.t("Видалити збірку"),
                 Dlg.text(I18n.t("Видалити збірку «") + p.name() + I18n.t("» разом з модами та світами?\n") + dir),
@@ -2346,6 +3945,7 @@ final class LauncherWindow extends JFrame {
         mKind.addItem(ModApi.Kind.PACK);
         mKind.addItem(ModApi.Kind.SHADER);
         mKind.addItem(ModApi.Kind.WORLD);
+        mKind.addItem(ModApi.Kind.MODPACK);
         mKind.placeholder = I18n.t("Оберіть категорію пошуку");
         mKind.setSelectedItem(null);
         mKind.setPreferredSize(new Dimension(260, 44));
@@ -2356,8 +3956,6 @@ final class LauncherWindow extends JFrame {
         mSrc.setSelectedItem(null);
         mSrc.setPreferredSize(new Dimension(190, 44));
 
-        Btn newB = small(new Btn(I18n.t("Нова збірка"), Btn.Kind.SECONDARY));
-        Btn delB = small(new Btn(I18n.t("Видалити збірку"), Btn.Kind.SECONDARY));
         Btn dirB = small(mDirB);
         small(mSearch);
         small(mToggleView);
@@ -2376,7 +3974,9 @@ final class LauncherWindow extends JFrame {
         Btn impB = small(new Btn(I18n.t("Імпортувати файли"), Btn.Kind.SECONDARY));
         impB.addActionListener(e -> importChooser());
         mImpB = impB;
-        JComponent[] r1c = {newB, delB, impB};
+        small(mManage);
+        mManage.setText(I18n.t("Керувати збіркою"));
+        JComponent[] r1c = {impB, mManage};
         for (int ci = 0; ci < r1c.length; ci++) {
             if (ci > 0) r1b.add(Box.createHorizontalStrut(8));
             r1c[ci].setAlignmentY(Component.CENTER_ALIGNMENT);
@@ -2384,7 +3984,6 @@ final class LauncherWindow extends JFrame {
         }
         r1b.add(Box.createHorizontalGlue());
         row1.add(r1b, BorderLayout.CENTER);
-        row1.add(mToggleView, BorderLayout.EAST);
 
         JPanel row2 = new JPanel(new BorderLayout(10, 0));
         row2.setOpaque(false);
@@ -2401,10 +4000,13 @@ final class LauncherWindow extends JFrame {
         r2b.add(mSearch);
         row2.add(r2b, BorderLayout.EAST);
 
+        mRow1 = row1; mRow2 = row2; mR1b = r1b; mR2b = r2b;
         JPanel top = new JPanel();
         mTop = top;
         top.setOpaque(false);
         top.setLayout(new BoxLayout(top, BoxLayout.Y_AXIS));
+        manageHead = buildManageHead();
+        top.add(manageHead);
         mInfoWrap.setOpaque(false);
         mInfoWrap.setLayout(new BoxLayout(mInfoWrap, BoxLayout.Y_AXIS));
         mInfo.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -2430,7 +4032,7 @@ final class LauncherWindow extends JFrame {
                 cell.meta = fmt(h.downloads()) + I18n.t(" завант.");
                 cell.sub = api.cached(h.desc());
                 final String u = h.iconUrl();
-                cell.icon = () -> modIcon(u, 40, mList);
+                cell.icon = () -> modIcon(u == null || u.isEmpty() ? "def" : u, 40, mList);
                 return cell;
             }
         });
@@ -2547,28 +4149,32 @@ final class LauncherWindow extends JFrame {
         Btn rmB = small(mRmB);
         small(iPage);
         iPage.setEnabled(false);
-        JPanel ib = new JPanel(new GridLayout(1, 4, 10, 0));
-        ib.setOpaque(false);
-        ib.add(togB);
-        ib.add(rmB);
-        ib.add(iPage);
-        ib.add(mDirB);
-        Inset iFoot = new Inset(new BorderLayout());
-        iFoot.add(ib, BorderLayout.CENTER);
+        small(mRootB);
+        JPanel selBtns = new JPanel();
+        selBtns.setOpaque(false);
+        selBtns.setLayout(new BoxLayout(selBtns, BoxLayout.X_AXIS));
+        selBtns.add(togB);
+        selBtns.add(Box.createHorizontalStrut(8));
+        selBtns.add(rmB);
+        selBtns.add(Box.createHorizontalStrut(8));
+        selBtns.add(iPage);
+        JPanel dirBtns = new JPanel();
+        dirBtns.setOpaque(false);
+        dirBtns.setLayout(new BoxLayout(dirBtns, BoxLayout.X_AXIS));
+        dirBtns.add(mDirB);
+        dirBtns.add(Box.createHorizontalStrut(8));
+        dirBtns.add(mRootB);
+        JPanel iFoot = new JPanel(new BorderLayout(12, 0));
+        iFoot.setOpaque(false);
+        iFoot.add(selBtns, BorderLayout.WEST);
+        iFoot.add(dirBtns, BorderLayout.EAST);
         JPanel iBody = new JPanel(new BorderLayout(0, 12));
         iBody.setOpaque(false);
         iBody.add(isp, BorderLayout.CENTER);
         iBody.add(iFoot, BorderLayout.SOUTH);
 
-        Btn backI = small(new Btn(I18n.t("Назад до пошуку"), Btn.Kind.SECONDARY));
-        backI.addActionListener(e -> showInstalledView(false));
-        JPanel ihead = new JPanel(new BorderLayout(10, 0));
-        ihead.setOpaque(false);
-        ihead.add(mInstTitle, BorderLayout.CENTER);
-        ihead.add(backI, BorderLayout.EAST);
         JPanel installedView = new JPanel(new BorderLayout(0, 12));
         installedView.setOpaque(false);
-        installedView.add(ihead, BorderLayout.NORTH);
         installedView.add(iBody, BorderLayout.CENTER);
         iList.addListSelectionListener(e -> { if (!e.getValueIsAdjusting()) onInstalledSelected(); });
         iPage.addActionListener(e -> {
@@ -2585,6 +4191,7 @@ final class LauncherWindow extends JFrame {
         mCenter.setOpaque(false);
         mCenter.add(searchView, "search");
         mCenter.add(installedView, "installed");
+        mCenter.add(packsView(), "packs");
         JPanel emptyV = new JPanel(new GridBagLayout());
         emptyV.setOpaque(false);
         Btn createB = new Btn(I18n.t("Створити збірку"), Btn.Kind.PRIMARY);
@@ -2611,6 +4218,7 @@ final class LauncherWindow extends JFrame {
         mCenter.add(loadV, "loading");
 
         Card c = new Card(new BorderLayout(0, 6), 16);
+        mCard = c;
         c.add(top, BorderLayout.NORTH);
         c.add(mCenter, BorderLayout.CENTER);
         p.add(c, BorderLayout.CENTER);
@@ -2661,6 +4269,7 @@ final class LauncherWindow extends JFrame {
             if (modsInit && !mFilling) { showInstalledView(false); onProfileChanged(); }
         });
         mKind.addActionListener(e -> {
+            syncPills();
             kindNow = curKind();
             if (mKind.getSelectedItem() instanceof ModApi.Kind && curKind().isWorld()
                     && (!srcChosen() || srcNow() == ModApi.Source.MODRINTH)) {
@@ -2671,21 +4280,37 @@ final class LauncherWindow extends JFrame {
                 cfg.save();
             }
             applyKindTexts();
-            if (modsInit && !mFilling) { showInstalledView(false); onProfileChanged(); }
+            if (modsInit && !mFilling) {
+                if (mInstalledView) {
+                    updateEmptyState();
+                    if (curKind().isPack()) refreshPackList(); else refreshInstalled();
+                }
+                else onProfileChanged();
+            }
         });
-        mQuery.addActionListener(e -> search(false, false));
-        mSearch.addActionListener(e -> search(false, false));
+        mQuery.setHint(I18n.t("Пошук…"));
+        mQuery.addActionListener(e -> { if (mInstalledView) applyInstalledFilter(); else search(false, false); });
+        mSearch.addActionListener(e -> { if (mInstalledView) applyInstalledFilter(); else search(false, false); });
+        mQuery.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            void ch() { if (mInstalledView && !mFilling) applyInstalledFilter(); }
+            @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { ch(); }
+            @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { ch(); }
+            @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { ch(); }
+        });
         mMore.addActionListener(e -> search(true, false));
-        mToggleView.addActionListener(e -> showInstalledView(!mInstalledView));
+        mManage.addActionListener(e -> openPackManager());
         mList.addListSelectionListener(e -> { if (!e.getValueIsAdjusting()) onHitSelected(); });
         mFiles.addActionListener(e -> {
             Object o = mFiles.getSelectedItem();
             mInstall.setText(o instanceof ModApi.ModFile && ((ModApi.ModFile) o).url() == null ? I18n.t("Відкрити на сайті") : I18n.t("Встановити"));
+            updatePackState();
+        });
+        mRootB.addActionListener(e -> {
+            Prof pf = curProf();
+            if (pf == null) msg(I18n.t("Спочатку створи збірку.")); else openFolder(instDir(pf.name()));
         });
         mInstall.addActionListener(e -> modInstall());
         mPage.addActionListener(e -> { ModApi.Hit h = mList.getSelectedValue(); if (h != null) browse(h.pageUrl()); });
-        newB.addActionListener(e -> newProfile());
-        delB.addActionListener(e -> deleteProfile());
         dirB.addActionListener(e -> {
             Prof pf = curProf();
             if (pf == null) msg(I18n.t("Спочатку створи збірку."));
@@ -2697,29 +4322,67 @@ final class LauncherWindow extends JFrame {
     }
 
     void updateEmptyState() {
-        boolean chosen = kindChosen(), hasProf = curProf() != null;
-        boolean tv = chosen && hasProf && !mInstalledView;
+        boolean chosen = kindChosen(), pack = chosen && curKind().isPack(), hasProf = curProf() != null;
+        boolean tv = false;
         if (mToggleView.isVisible() != tv) {
             mToggleView.setVisible(tv);
             if (mToggleView.getParent() != null) { mToggleView.getParent().revalidate(); mToggleView.getParent().repaint(); }
         }
+        if (mManage.isVisible() != hasProf) mManage.setVisible(hasProf);
         if (mTop != null && mTop.isVisible() != hasProf) {
             mTop.setVisible(hasProf);
             if (mTop.getParent() != null) { mTop.getParent().revalidate(); mTop.getParent().repaint(); }
         }
-        mQuery.setEnabled(chosen && hasProf);
-        if (!mLoading) mSearch.setEnabled(chosen && hasProf);
-        mCards.show(mCenter, !hasProf ? "empty" : !chosen ? "pick" : mInstalledView ? "installed"
+        mQuery.setEnabled((chosen || mInstalledView) && hasProf);
+        if (!mLoading) mSearch.setEnabled((chosen || mInstalledView) && hasProf);
+        mCards.show(mCenter, !hasProf ? "empty" : mInstalledView && mKind.getSelectedItem() instanceof ModApi.Kind ? (curKind().isPack() ? "packs" : "installed") : !chosen ? "pick"
                 : mLoading && mModel.isEmpty() ? "loading" : "search");
     }
 
+    Object savedKind;
+
     void showInstalledView(boolean installed) {
+        boolean changed = installed != mInstalledView;
+        if (installed && changed) savedQuery = mQuery.getText();
+        mFilling = true;
+        try {
+            if (changed) {
+                mQuery.setText(installed ? "" : savedQuery);
+                if (installed) {
+                    // у керуванні «Збірки модів» не потрібні, а категорію користувач обирає наново
+                    savedKind = mKind.getSelectedItem();
+                    mKind.placeholder = I18n.t("Обрати категорію");
+                    mKind.setSelectedItem(ModApi.Kind.MOD);
+                } else {
+                    mKind.placeholder = I18n.t("Оберіть категорію пошуку");
+                    if (!(mKind.getSelectedItem() instanceof ModApi.Kind)) mKind.setSelectedItem(savedKind);
+                }
+                kindNow = curKind();
+            }
+        } finally { mFilling = false; }
         mInstalledView = installed;
-        mToggleView.setVisible(!installed);
+        placeManageControls(installed);
+        if (!mBusy) { mfSeq.incrementAndGet(); mStatus.setText(" "); }
+        manageHead.setVisible(installed);
+        mRow1.setVisible(!installed);
+        mRow2.setVisible(!installed);
+        mKind.setVisible(!installed);
+        mProf.setVisible(!installed);
+        mSearch.setVisible(!installed);
+        if (installed) updateManageHead();
+        syncPills();
+        if (mTop != null) { mTop.revalidate(); mTop.repaint(); }
+                mToggleView.setVisible(false);
+        mSrc.setVisible(!installed);
+        mQuery.setHint(installed ? I18n.t("Пошук у встановлених…") : I18n.t("Пошук…"));
+        mManage.setText(installed ? I18n.t("Назад до пошуку") : I18n.t("Керувати збіркою"));
         updateEmptyState();
         applyKindTexts();
-        if (mToggleView.getParent() != null) mToggleView.getParent().revalidate();
-        if (installed) refreshInstalled();
+        if (mManage.getParent() != null) { mManage.getParent().revalidate(); mManage.getParent().repaint(); }
+        if (mSrc.getParent() != null) { mSrc.getParent().revalidate(); mSrc.getParent().repaint(); }
+        mKind.repaint();
+        if (installed) { iModel.clear(); iAll.clear(); if (mKind.getSelectedItem() instanceof ModApi.Kind) { if (curKind().isPack()) refreshPackList(); else refreshInstalled(); } }
+        else if (changed && modsInit) onProfileChanged();
     }
 
     ModApi.Kind curKind() {
@@ -2911,10 +4574,12 @@ final class LauncherWindow extends JFrame {
     void search(boolean more, boolean quiet) {
         if (!kindChosen()) return;
         Prof p = curProf();
-        if (p == null) { if (!quiet) msg(I18n.t("Спочатку створи збірку («Нова збірка»).")); return; }
         ModApi.Kind k = curKind();
+        if (p == null) { if (!quiet) msg(I18n.t("Спочатку створи збірку у вкладці «Бібліотека».")); return; }
+        final String smc = p.mc(), sld = p.loader();
+        final String tgt = target(k, p);
         final ModApi.Source src = srcNow();
-        if (k.isMod() && p.loader().equals("Vanilla")) {
+        if ((k.isMod() || k.isPack()) && sld.equals("Vanilla")) {
             if (!quiet) msg(I18n.t("Чиста збірка не підтримує моди.\nСтвори збірку на основі Fabric / Quilt / Forge / NeoForge."));
             return;
         }
@@ -2935,7 +4600,7 @@ final class LauncherWindow extends JFrame {
         new Thread(() -> {
             List<ModApi.Hit> res = null;
             String err = null;
-            try { res = api.search(src, k, q, p.mc(), p.loader(), off); } catch (Exception ex) { err = ex.getMessage(); }
+            try { res = api.search(src, k, q, smc, sld, off); } catch (Exception ex) { err = ex.getMessage(); }
             if (res != null && my == mSeq.get()) warmHits(res, more ? 1500 : 900, more, () -> my != mSeq.get());
             List<ModApi.Hit> rr = res;
             String er = err;
@@ -2950,8 +4615,8 @@ final class LauncherWindow extends JFrame {
                 if (!more && mModel.isEmpty()) showDetails(null);
                 mMore.setEnabled(rr != null && rr.size() >= ModApi.PAGE);
                 mStatus.setText(er != null ? I18n.t("Помилка пошуку: ") + er
-                        : mModel.isEmpty() ? I18n.t("Нічого не знайдено для ") + target(k, p)
-                        : I18n.t("Знайдено: ") + mModel.size() + " • " + k.title + " • " + src.label + " • " + target(k, p));
+                        : mModel.isEmpty() ? (k.isPack() ? I18n.t("Нічого не знайдено") : I18n.t("Нічого не знайдено для ") + tgt)
+                        : I18n.t("Знайдено: ") + mModel.size() + " • " + k.title + " • " + src.label + " • " + tgt);
                 mBar.set(0);
                 if (rr != null) translateHits();
             });
@@ -2966,16 +4631,19 @@ final class LauncherWindow extends JFrame {
         mInstall.setEnabled(false);
         int my = mfSeq.incrementAndGet();
         if (h == null || p == null) return;
-        mStatus.setText(I18n.t("Завантаження версій…"));
+        final String smc = p.mc(), sld = p.loader();
+        final String tgt = target(h.kind(), p);
+        mStatus.setText(" ");
         new Thread(() -> {
             List<ModApi.ModFile> res = null;
             String err = null;
-            try { res = api.files(h.kind(), h.id(), p.mc(), p.loader()); } catch (Exception ex) { err = ex.getMessage(); }
+            try { res = api.files(h.kind(), h.id(), smc, sld); } catch (Exception ex) { err = ex.getMessage(); }
             List<ModApi.ModFile> rr = res;
             String er = err;
             SwingUtilities.invokeLater(() -> {
                 if (my != mfSeq.get()) return;
                 mFiles.removeAllItems();
+                Modpacks.Pick packPick = null;
                 boolean ok = rr != null && !rr.isEmpty();
                 if (ok) {
                     int idx = 0;
@@ -2983,20 +4651,78 @@ final class LauncherWindow extends JFrame {
                         mFiles.addItem(rr.get(i));
                     }
                     for (int i = 0; i < rr.size(); i++) if (rr.get(i).channel().equals("release")) { idx = i; break; }
+                    if (h.kind().isPack()) { packPick = Modpacks.pick(rr, smc, sld); if (packPick != null) idx = packPick.index(); }
                     mFiles.setSelectedIndex(idx);
                 }
                 mInstall.setEnabled(ok && !mBusy);
+                updatePackState();
                 mStatus.setText(er != null ? I18n.t("Помилка: ") + er
-                        : ok ? I18n.t("Версій для ") + target(h.kind(), p) + ": " + rr.size()
-                        : I18n.t("Немає файлів для ") + target(h.kind(), p) + I18n.t(" — не підтримує цю збірку"));
+                        : ok && h.kind().isPack() ? packPickStatus(packPick, tgt, rr.size())
+                        : ok ? " "
+                        : h.kind().isPack() ? I18n.t("Для цієї збірки немає файлів, які можна встановити")
+                        : I18n.t("Немає файлів для ") + tgt + I18n.t(" — не підтримує цю збірку"));
             });
         }, "mod-files").start();
+    }
+
+    /** Рядок стану після вибору найближчої версії модпака. */
+    String packPickStatus(Modpacks.Pick pk, String mc, int total) {
+        if (pk == null || pk.nearestMc() == null) return " ";
+        if (pk.exact()) return I18n.t("Обрано версію для Minecraft ") + mc;
+        String w = I18n.t("Увага: ") + I18n.t("на ") + mc + I18n.t(" немає, є на ") + pk.nearestMc() + I18n.t(" (найближча)");
+        if (pk.newestMc() != null && !pk.newestMc().equals(pk.nearestMc())) w += I18n.t(", найновіша — ") + pk.newestMc();
+        return w;
+    }
+
+    /** Попередження, якщо версія гри обраного файлу модпака не збігається з версією гри збірки. Порожній рядок — усе гаразд. */
+    String packVersionNote(Prof p, ModApi.ModFile f) {
+        if (f.mcs().isEmpty() || f.mcs().contains(p.mc())) return "";
+        List<ModApi.ModFile> all = new ArrayList<>();
+        for (int i = 0; i < mFiles.getItemCount(); i++) all.add(mFiles.getItemAt(i));
+        Modpacks.Pick pk = Modpacks.pick(all, p.mc(), p.loader());
+        String have = String.join(", ", f.mcs());
+        StringBuilder sb = new StringBuilder(I18n.t("На версію Minecraft ") + p.mc() + I18n.t(" (твоя збірка) такої збірки модів немає.\n"));
+        sb.append(I18n.t("Обрана версія зроблена для Minecraft ")).append(have).append(".");
+        if (pk != null && pk.newestMc() != null && !f.mcs().contains(pk.newestMc()))
+            sb.append(I18n.t(" Найновіша, що є: ")).append(pk.newestMc()).append(".");
+        sb.append(I18n.t("\nМоди можуть не запрацювати."));
+        return sb.toString();
+    }
+
+    /** Збірка модів із пошуку: ставиться в обрану зверху існуючу збірку, нової збірки не створює. */
+    void installPack(ModApi.Hit h, ModApi.ModFile f) {
+        if (mBusy || busy) return;
+        if (isPackInstalled(curProf(), h)) { updatePackState(); return; }
+        Prof p = curProf();
+        if (p == null) { msg(I18n.t("Спочатку створи збірку у вкладці «Бібліотека» або обери наявну — збірка модів встановлюється в неї.")); return; }
+        if (p.loader().equalsIgnoreCase("Vanilla")) {
+            msg(I18n.t("Чиста збірка не підтримує моди.\nОбери збірку на основі Fabric / Quilt / Forge / NeoForge."));
+            return;
+        }
+        if (f.url() == null) {
+            browse(h.pageUrl());
+            msg(I18n.t("Автор заборонив завантаження сторонніми запускачами — візьми збірку на сайті."));
+            return;
+        }
+        if (!f.loaders().isEmpty() && !Modpacks.loaderOk(f, p.loader())) {
+            msg(I18n.t("Ця версія збірки модів зроблена для: ") + String.join(", ", f.loaders())
+                    + I18n.t(", а твоя збірка «") + p.name() + I18n.t("» — на ") + p.loader()
+                    + I18n.t(".\nМоди не запрацюють. Обери іншу версію або іншу збірку."));
+            return;
+        }
+        String warn = packVersionNote(p, f);
+        String body = I18n.t("Усі моди та налаштування збірки «") + h.title() + I18n.t("» буде встановлено у твою збірку «") + p.name()
+                + I18n.t("» (") + p.loader() + " " + p.mc() + ")."
+                + (warn.isEmpty() ? "" : "\n\n" + I18n.t("Увага: ") + warn);
+        if (!Dlg.show(this, h.title(), Dlg.text(body), I18n.t("Встановити"), I18n.t("Скасувати"))) return;
+        installPackInto(p, h, f);
     }
 
     void modInstall() {
         Prof p = curProf();
         ModApi.Hit h = mList.getSelectedValue();
         Object fo = mFiles.getSelectedItem();
+        if (h != null && h.kind().isPack() && fo instanceof ModApi.ModFile) { installPack(h, (ModApi.ModFile) fo); return; }
         if (p == null || h == null || !(fo instanceof ModApi.ModFile)) return;
         ModApi.ModFile f = (ModApi.ModFile) fo;
         if (f.url() == null) {
@@ -3042,31 +4768,54 @@ final class LauncherWindow extends JFrame {
     }
 
     /** Одна кнопка імпорту: у вікні обирається, що саме переносимо — моди, набори ресурсів чи шейдери. */
-    void importChooser() {
-        if (curProf() == null) { msg(I18n.t("Спочатку створи збірку («Нова збірка»).")); return; }
-        if (mBusy) return;
-        Combo<ModApi.Kind> what = new Combo<>();
-        what.addItem(ModApi.Kind.MOD);
-        what.addItem(ModApi.Kind.PACK);
-        what.addItem(ModApi.Kind.SHADER);
-        what.setPreferredSize(new Dimension(Theme.px(320), Theme.px(44)));
+    void importChooser() { importChooser(curProf()); }
+
+    record ImpChoice(String label, ModApi.Kind kind) {
+        @Override public String toString() { return label; }
+    }
+
+    /** «Імпорт» у вказану збірку: файли (моди / набори ресурсів / шейдери) або цілу збірку модів. */
+    void importChooser(Prof p) {
+        if (p == null) { msg(I18n.t("Спочатку створи збірку.")); return; }
+        if (mBusy || busy) { msg(I18n.t("Зачекай, поки завершиться завантаження.")); return; }
+        Combo<ImpChoice> what = new Combo<>();
+        what.addItem(new ImpChoice(I18n.t("Моди"), ModApi.Kind.MOD));
+        what.addItem(new ImpChoice(I18n.t("Набори ресурсів"), ModApi.Kind.PACK));
+        what.addItem(new ImpChoice(I18n.t("Шейдери"), ModApi.Kind.SHADER));
+        what.addItem(new ImpChoice(I18n.t("Збірки модів"), null));
+        what.setPreferredSize(new Dimension(Theme.px(340), Theme.px(44)));
         JPanel box = new JPanel();
         box.setOpaque(false);
         box.setLayout(new BoxLayout(box, BoxLayout.Y_AXIS));
-        JLabel lb = label(I18n.t("Що імпортувати?"), 13, true, Theme.MUTED);
+        JLabel lb = label(I18n.t("Що імпортувати у збірку «") + p.name() + "»?", 13, true, Theme.MUTED);
+        JLabel hint = label(" ", 12, false, Theme.MUTED);
+        Runnable upd = () -> {
+            ImpChoice c = (ImpChoice) what.getSelectedItem();
+            hint.setText(c == null || c.kind() != null
+                    ? I18n.t("Обери папку іншої збірки або окремі файли — підходящі буде перенесено.")
+                    : I18n.t("Файл збірки модів, завантажений на диск: усі моди й налаштування з нього встановляться в цю збірку."));
+        };
+        what.addActionListener(e -> upd.run());
+        upd.run();
         lb.setAlignmentX(Component.LEFT_ALIGNMENT);
         what.setAlignmentX(Component.LEFT_ALIGNMENT);
+        hint.setAlignmentX(Component.LEFT_ALIGNMENT);
         box.add(lb);
         box.add(Box.createVerticalStrut(8));
         box.add(what);
-        if (!Dlg.show(this, I18n.t("Імпортувати файли"), box, I18n.t("Далі"), I18n.t("Скасувати"))) return;
-        importMods((ModApi.Kind) what.getSelectedItem());
+        box.add(Box.createVerticalStrut(8));
+        box.add(hint);
+        if (!Dlg.show(this, I18n.t("Імпорт у збірку"), box, I18n.t("Далі"), I18n.t("Скасувати"))) return;
+        ImpChoice c = (ImpChoice) what.getSelectedItem();
+        if (c == null) return;
+        if (c.kind() == null) importModpackFile(p); else importMods(p, c.kind());
     }
 
-    void importMods(ModApi.Kind ik) {
-        Prof p = curProf();
-        if (p == null) { msg(I18n.t("Спочатку створи збірку («Нова збірка»).")); return; }
-        if (mBusy) return;
+    void importMods(ModApi.Kind ik) { importMods(curProf(), ik); }
+
+    void importMods(Prof p, ModApi.Kind ik) {
+        if (p == null) { msg(I18n.t("Спочатку створи збірку.")); return; }
+        if (mBusy || busy) { msg(I18n.t("Зачекай, поки завершиться завантаження.")); return; }
         final String ext = ik.isMod() ? ".jar" : ".zip";
         File[] picked = FilePick.show(this, ik.isMod()
                         ? I18n.t("Обери папку збірки (або папку mods) чи окремі .jar")
@@ -3099,9 +4848,9 @@ final class LauncherWindow extends JFrame {
             try {
                 for (int i = 0; i < jars.size(); i++) {
                     double frac = (double) i / jars.size();
-                    SwingUtilities.invokeLater(() -> mBar.set(frac));
+                    SwingUtilities.invokeLater(() -> { mBar.set(frac); libProgress(I18n.t("Імпорт у «") + p.name() + "»…", frac); });
                     rows.add(api.importFile(ik, jars.get(i), p.mc(), p.loader(), dir, seen,
-                            t -> SwingUtilities.invokeLater(() -> mStatus.setText(t)), () -> mCancelled));
+                            t -> SwingUtilities.invokeLater(() -> { mStatus.setText(t); libProgress(t, (double) 0.5); }), () -> mCancelled));
                 }
             } catch (Engine.Cancelled ex) {
                 cancelled = true;
@@ -3116,6 +4865,7 @@ final class LauncherWindow extends JFrame {
                 if (wasCancelled) mBar.set(0); else mBar.done();
                 mStatus.setText(wasCancelled ? I18n.t("Завантаження скасовано") : I18n.t("Готово"));
                 refreshInstalled();
+                libProgressEnd();
                 showImportReport(p, rows, jars.size(), ik);
             });
         }, "mod-import").start();
@@ -3149,6 +4899,7 @@ final class LauncherWindow extends JFrame {
 
     void refreshInstalled() {
         iModel.clear();
+        if (kindChosen0() && curKind().isPack()) { refreshPackList(); return; }
         Prof p = curProf();
         if (p == null) return;
         ModApi.Kind k = curKind();
@@ -3162,9 +4913,25 @@ final class LauncherWindow extends JFrame {
                     .sorted(String.CASE_INSENSITIVE_ORDER)
                     .forEach(names::add);
         } catch (IOException ignored) { }
-        if (!names.isEmpty()) iModel.addAll(names);
-        if (!iModel.isEmpty()) iList.setSelectedIndex(0); else onInstalledSelected();
+        iAll.clear();
+        iAll.addAll(names);
+        applyInstalledFilter();
         loadInstalledIcons(d, k, names);
+    }
+
+    final List<String> iAll = new ArrayList<>();
+
+    /** Пошук у вкладці редагування: відфільтровує встановлені файли (моди, ресурси, шейдери, мапи) за назвою. */
+    void applyInstalledFilter() {
+        String q = mQuery.getText().trim().toLowerCase(Locale.ROOT);
+        String sel = iList.getSelectedValue();
+        iModel.clear();
+        List<String> out = new ArrayList<>();
+        for (String n : iAll) if (q.isEmpty() || n.toLowerCase(Locale.ROOT).contains(q)) out.add(n);
+        if (!out.isEmpty()) iModel.addAll(out);
+        if (!iModel.isEmpty()) {
+            if (sel != null && out.contains(sel)) iList.setSelectedValue(sel, true); else iList.setSelectedIndex(0);
+        } else onInstalledSelected();
     }
 
     void loadInstalledIcons(Path d, ModApi.Kind k, List<String> names) {
@@ -3181,8 +4948,18 @@ final class LauncherWindow extends JFrame {
                 List<String> unknown = new ArrayList<>();
                 for (String b : bases) if (!f2p.containsKey(b)) unknown.add(b);
                 if (!unknown.isEmpty()) f2p.putAll(api.identify(d, unknown));
-                if (!f2p.isEmpty()) urls.putAll(api.iconUrls(new HashSet<>(f2p.values())));
             } catch (Throwable ignored) { }
+            for (int attempt = 0; attempt < 3 && !f2p.isEmpty(); attempt++) {
+                try {
+                    Set<String> pids = new HashSet<>(f2p.values());
+                    pids.removeAll(urls.keySet());
+                    if (pids.isEmpty()) break;
+                    urls.putAll(api.iconUrls(pids));
+                    break;
+                } catch (Throwable ignored) {
+                    try { Thread.sleep(1500L * (attempt + 1)); } catch (InterruptedException ie) { break; }
+                }
+            }
             if (my != iSeq.get()) return;
             for (String b : bases) { String pid = f2p.get(b); if (pid != null) iProj.put(key + "|" + b, pid); }
             SwingUtilities.invokeLater(() -> { if (my == iSeq.get()) onInstalledSelected(); });
@@ -3199,10 +4976,14 @@ final class LauncherWindow extends JFrame {
                     String pid = f2p.get(b);
                     String u = pid == null ? null : urls.get(pid);
                     if (u != null && !u.isEmpty()) {
-                        BufferedImage im = iconRaw.get(u);
-                        if (im == null) {
-                            im = fetchProjectIcon(u);
-                            if (im != null) iconRaw.put(u, im);
+                        BufferedImage im = null;
+                        for (int attempt = 0; attempt < 3 && im == null; attempt++) {
+                            im = iconRaw.get(u);
+                            if (im == null) {
+                                im = fetchProjectIcon(u);
+                                if (im != null) iconRaw.put(u, im);
+                                else try { Thread.sleep(1000L * (attempt + 1)); } catch (InterruptedException ie) { break; }
+                            }
                         }
                         if (im != null && im != NO_ICON) tok = u;
                     }
@@ -3215,7 +4996,9 @@ final class LauncherWindow extends JFrame {
                             iconRaw.put(tok, roundIcon(em, 64));
                         }
                     }
-                    if (tok != null) { prebuildIcon(tok, iconRaw.get(tok)); fileIcon.put(key + "|" + b, tok); }
+                    if (tok != null) prebuildIcon(tok, iconRaw.get(tok));
+                    else tok = "def";
+                    fileIcon.put(key + "|" + b, tok);
                     repaintInstalledSoon();
                 });
             }
@@ -3269,19 +5052,46 @@ final class LauncherWindow extends JFrame {
 
     Icon modIcon(String url, int size, JComponent target) {
         if (url == null || url.isEmpty()) return iconObjs.computeIfAbsent("@" + size, k -> new ImgIcon(null, size));
+        if (url.equals("def")) return iconObjs.computeIfAbsent("@def" + size, k -> ImgIcon.fallback(size));
         BufferedImage im = iconRaw.get(url);
         if (im == null) {
             loadIcon(url, target);
             return iconObjs.computeIfAbsent("@" + size, k -> new ImgIcon(null, size));
         }
-        if (im == NO_ICON) return iconObjs.computeIfAbsent("@" + size, k -> new ImgIcon(null, size));
+        if (im == NO_ICON) return iconObjs.computeIfAbsent("@def" + size, k -> ImgIcon.fallback(size));
         return iconObjs.computeIfAbsent(url + "@" + size, k -> new ImgIcon(im, size));
     }
 
     final Map<String, Integer> iconFails = new ConcurrentHashMap<>();
     final Map<String, Long> iconRetryAt = new ConcurrentHashMap<>();
 
+    /** Чи вміє Java читати WebP (стандартно — ні; тоді одразу беремо оригінал іконки, а не мініатюру _96.webp). */
+    static final boolean WEBP_OK = javax.imageio.ImageIO.getImageReadersByFormatName("webp").hasNext();
+    static final Pattern WEBP_THUMB = Pattern.compile(".*_\\d+\\.webp(\\?.*)?$");
+
+    /** Одна й та сама іконка вантажиться лише раз, навіть якщо її одночасно просять кілька потоків. */
+    final Map<String, CompletableFuture<BufferedImage>> iconFlight = new ConcurrentHashMap<>();
+
+    /**
+     * Повертає іконку; NO_ICON — іконки точно немає (404 / не зображення); null — тимчасова помилка мережі, варто повторити пізніше.
+     */
     BufferedImage fetchProjectIcon(String url) {
+        CompletableFuture<BufferedImage> mine = new CompletableFuture<>();
+        CompletableFuture<BufferedImage> other = iconFlight.putIfAbsent(url, mine);
+        if (other != null) {
+            try { return other.get(40, TimeUnit.SECONDS); } catch (Throwable e) { return null; }
+        }
+        BufferedImage res = null;
+        try {
+            res = fetchProjectIconCached(url);
+            return res;
+        } finally {
+            mine.complete(res);
+            iconFlight.remove(url);
+        }
+    }
+
+    private BufferedImage fetchProjectIconCached(String url) {
         Path cf = null;
         try {
             cf = api.cacheDir("icons").resolve(ModApi.sha1s(url) + ".png");
@@ -3291,25 +5101,32 @@ final class LauncherWindow extends JFrame {
             }
         } catch (Throwable ignored) { }
         BufferedImage got = fetchProjectIconNet(url);
-        if (got != null && cf != null) {
-            try { javax.imageio.ImageIO.write(got, "png", cf.toFile()); } catch (Throwable ignored) { }
+        if (got != null && got != NO_ICON && cf != null) {
+            try {
+                Path tmp = cf.resolveSibling(cf.getFileName() + ".tmp");
+                javax.imageio.ImageIO.write(got, "png", tmp.toFile());
+                Files.move(tmp, cf, StandardCopyOption.REPLACE_EXISTING);
+            } catch (Throwable ignored) { }
         }
         return got;
     }
 
     BufferedImage fetchProjectIconNet(String url) {
         try {
-            BufferedImage src = fetchImage(url);
-            if (src == null && url.matches(".*_\\d+\\.webp(\\?.*)?$")) {
+            boolean thumb = WEBP_THUMB.matcher(url).matches();
+            BufferedImage src = thumb && !WEBP_OK ? null : fetchImage(url);
+            if (src == null && thumb) {
                 String base = url.replaceAll("_\\d+\\.webp(\\?.*)?$", "");
                 for (String ext : new String[]{".png", ".jpg", ".jpeg", ".gif"}) {
                     src = fetchImage(base + ext);
                     if (src != null) break;
                 }
             }
-            return src == null ? null : roundIcon(src, 64);
-        } catch (Throwable e) {
+            return src == null ? NO_ICON : roundIcon(src, 64);
+        } catch (IOException e) {
             return null;
+        } catch (Throwable e) {
+            return NO_ICON;
         }
     }
 
@@ -3321,9 +5138,14 @@ final class LauncherWindow extends JFrame {
             BufferedImage res = fetchProjectIcon(url);
             if (res == null) {
                 int n = iconFails.merge(url, 1, Integer::sum);
-                if (n < 3) {
-                    iconRetryAt.put(url, System.currentTimeMillis() + 15_000);
+                if (n < 6) {
+                    iconRetryAt.put(url, System.currentTimeMillis() + 3_000L * n);
                     iconBusy.remove(url);
+                    SwingUtilities.invokeLater(() -> {
+                        javax.swing.Timer t = new javax.swing.Timer((int) (3_000L * n) + 200, ev -> target.repaint());
+                        t.setRepeats(false);
+                        t.start();
+                    });
                     return;
                 }
                 res = NO_ICON;
@@ -3335,19 +5157,23 @@ final class LauncherWindow extends JFrame {
         });
     }
 
-    BufferedImage fetchImage(String url) {
+    /** null — картинки там немає (404 / не зображення); IOException — тимчасова помилка (мережа, 429, 5xx). */
+    BufferedImage fetchImage(String url) throws IOException {
+        HttpRequest rq = HttpRequest.newBuilder(URI.create(url)).header("User-Agent", "PaxLauncher/1.0")
+                .timeout(Duration.ofSeconds(15)).build();
+        HttpResponse<byte[]> r;
         try {
-            HttpRequest rq = HttpRequest.newBuilder(URI.create(url)).header("User-Agent", "PaxLauncher/1.0")
-                    .timeout(Duration.ofSeconds(15)).build();
-            HttpResponse<java.io.InputStream> r = engine.http.send(rq, HttpResponse.BodyHandlers.ofInputStream());
-            if (r.statusCode() != 200) { r.body().close(); return null; }
-            byte[] body;
-            try (java.io.InputStream in = r.body()) { body = in.readNBytes(4_000_001); }
-            if (body.length > 4_000_000) return null;
-            return ModApi.readImage(body);
-        } catch (Throwable e) {
-            return null;
+            r = engine.sendRetry(rq, HttpResponse.BodyHandlers.ofByteArray());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted");
         }
+        int sc = r.statusCode();
+        if (sc == 408 || sc == 429 || sc >= 500) throw new IOException("HTTP " + sc);
+        if (sc != 200) return null;
+        byte[] body = r.body();
+        if (body.length > 4_000_000) return null;
+        return ModApi.readImage(body);
     }
 
     static BufferedImage roundIcon(BufferedImage src, int s) {
@@ -4091,6 +5917,12 @@ final class LauncherWindow extends JFrame {
     }
 
     void play() {
+        final String jt = joinTarget;
+        joinTarget = null;
+        final String jc = pendingJoin;
+        pendingJoin = null;
+        final String hw = hostWorld;
+        final int hport = hostLanPort;
         Accounts.Acc acc = accounts.current();
         if (acc == null) { msg(I18n.t("Спочатку обери обліківку.")); showLogin(); return; }
         Object o = versions.getSelectedItem();
@@ -4102,7 +5934,8 @@ final class LauncherWindow extends JFrame {
         bar.set(0);
         engine.stop = false;
         cancelUi(true, cancelBtn, pauseBtn);
-        boolean hide = hideC.isSelected();
+        // хост бачить лаунчер (там код і стан сесії); гість ховає його за налаштуванням, як зазвичай
+        boolean hide = hideC.isSelected() && hw == null;
         Engine.Progress pg = (t, f) -> SwingUtilities.invokeLater(() -> { status.setText(t); bar.set(f); });
 
         final boolean[] started = {false}, ended = {false};
@@ -4116,11 +5949,41 @@ final class LauncherWindow extends JFrame {
                 pg.update(I18n.t("Перевірка обліківки…"), 0);
                 Accounts.Acc a = accounts.ensureFresh(acc, Accounts.LEGACY_CID);
                 List<String> cmd = engine.build(v, cfg, a, pg, gd);
+                if (hw != null && hport > 0 && lan != null) {
+                    String mcj = Json.string(v.get("_jar")) != null ? Json.string(v.get("_jar")) : it.id();
+                    try {
+                        Path ag = LanAgent.ensure(root);
+                        Path flag = flagPath();
+                        Files.createDirectories(flag.getParent());
+                        Files.deleteIfExists(flag);
+                        cmd = new ArrayList<>(cmd);
+                        Path cfgf = flag.resolveSibling("lan.cfg");
+                        Files.writeString(cfgf, hport + "\n" + gd.resolve("saves") + "\n" + hw + "\n" + flag + "\n"
+                                + (cfg.getb("allowOffline", false) ? "1" : "0") + "\n", java.nio.charset.StandardCharsets.UTF_8);
+                        cmd.add(1, "-javaagent:" + ag + "=" + cfgf);
+                        if (Invite.modern(mcj)) { cmd.add("--quickPlaySingleplayer"); cmd.add(hw); }
+                        log(I18n.t("Світ «") + hw + I18n.t("» відкриється для друзів, щойно ти в нього зайдеш."));
+                    } catch (Throwable ex) {
+                        log(I18n.t("Авто-відкриття світу недоступне: ") + ex.getMessage());
+                    }
+                }
+                if (jt != null) {
+                    String mcj = Json.string(v.get("_jar")) != null ? Json.string(v.get("_jar")) : it.id();
+                    cmd = new ArrayList<>(cmd);
+                    cmd.addAll(Invite.joinArgs(mcj, jt));
+                    log(I18n.t("Автовхід на сервер друга: ") + jt);
+                }
                 firstLaunchLang(gd, Json.string(v.get("_jar")) != null ? Json.string(v.get("_jar")) : it.id());
                 String line = String.join(" ", cmd);
                 if (a.token().length() > 3) line = line.replace(a.token(), "***");
                 log(I18n.t("Запуск: ") + (line.length() > 500 ? line.substring(0, 500) + " …" : line));
                 Process pr = new ProcessBuilder(cmd).directory(gd.toFile()).redirectErrorStream(true).start();
+                if (jt != null && jc != null) {
+                    joinProc = pr;
+                    joinCode = jc;
+                    SwingUtilities.invokeLater(this::refreshFriendsCard);
+                    startJoinMonitor(jc, jt);
+                }
                 started[0] = true;
                 running.add(accKey(acc));
                 if (it.profile() == null) noteSession(it.id(), gd);
@@ -4136,9 +5999,30 @@ final class LauncherWindow extends JFrame {
                 if (hide) SwingUtilities.invokeLater(() -> { setVisible(false); trimMemory(); });
                 try (BufferedReader r = new BufferedReader(new InputStreamReader(pr.getInputStream(), StandardCharsets.UTF_8))) {
                     String ln;
-                    while ((ln = r.readLine()) != null) log(ln);
+                    while ((ln = r.readLine()) != null) { log(ln); inviteHook(ln); }
                 }
                 int code = pr.waitFor();
+                if (lan != null && jt == null) {
+                    // сесія живе, доки відкрита гра хоста: закрив Minecraft — сесія неактивна
+                    SwingUtilities.invokeLater(() -> {
+                        if (lan != null) {
+                            hostStop();
+                            status.setText(I18n.t("Сесію завершено: гру закрито"));
+                        }
+                    });
+                }
+                if (jt != null) {
+                    try {
+                        String[] hp = jt.split(":");
+                        if (LanProxy.probe(hp[0], Integer.parseInt(hp[1])) == 2)
+                            for (Path d : allGameDirs()) Nbt.removeServer(d.resolve("servers.dat"), "Гра з друзями");
+                    } catch (Exception ignored) { }
+                }
+                if (jt != null && joinProc == pr) {
+                    joinProc = null;
+                    joinCode = null;
+                    SwingUtilities.invokeLater(this::refreshFriendsCard);
+                }
                 log(I18n.t("Гра завершилась з кодом ") + code);
                 inGame = games.decrementAndGet() > 0;
                 running.remove(accKey(acc));

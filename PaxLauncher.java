@@ -163,6 +163,8 @@ public class PaxLauncher {
 
     public static void main(String[] args) {
         if (relaunchLean()) { System.exit(0); return; }
+        // Закривати «сплячі» HTTP-з'єднання раніше за сервер — менше обривів на кшталт «chunked transfer encoding»
+        System.setProperty("jdk.httpclient.keepalive.timeout", "8");
         System.setProperty("awt.useSystemAAFontSettings", "on");
         System.setProperty("swing.aatext", "true");
         System.setProperty("sun.java2d.d3d", "false");

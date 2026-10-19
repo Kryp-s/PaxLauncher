@@ -49,6 +49,29 @@ final class Engine {
             .version(HttpClient.Version.HTTP_1_1)
             .followRedirects(HttpClient.Redirect.NORMAL)
             .connectTimeout(Duration.ofSeconds(15)).build();
+    /** Клієнт для дрібних API-запитів та іконок: HTTP/2 (багато запитів в одному з'єднанні, без chunked-обривів HTTP/1.1). */
+    final HttpClient web = HttpClient.newBuilder()
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .connectTimeout(Duration.ofSeconds(15)).build();
+
+    /**
+     * Запит із повторами: обрив з'єднання посеред відповіді (наприклад «chunked transfer encoding, state: READING_DATA»)
+     * — звичайна річ для CDN, коли з'єднання з пулу вже закрите сервером. Двічі пробуємо HTTP/2, востаннє — HTTP/1.1.
+     */
+    <T> java.net.http.HttpResponse<T> sendRetry(java.net.http.HttpRequest rq, java.net.http.HttpResponse.BodyHandler<T> bh)
+            throws IOException, InterruptedException {
+        IOException last = null;
+        for (int i = 0; i < 3; i++) {
+            try {
+                return (i < 2 ? web : http).send(rq, bh);
+            } catch (IOException e) {
+                last = e;
+            }
+            if (i < 2) Thread.sleep(300L * (i + 1));
+        }
+        throw new IOException(I18n.t("Помилка мережі: ") + last.getMessage(), last);
+    }
+
     final Map<String, String> urls = new ConcurrentHashMap<>();
     final Map<String, String> shas = new ConcurrentHashMap<>();
     volatile List<VInfo> manifest = new ArrayList<>();
@@ -386,18 +409,40 @@ final class Engine {
             waitPause(cancel);
             if (t > 0) { try { Thread.sleep(400L * t); } catch (InterruptedException ie) { throw new Cancelled(); } }
             try {
-                HttpRequest r = HttpRequest.newBuilder(URI.create(url))
-                        .header("User-Agent", "PaxLauncher/1.0").timeout(Duration.ofMinutes(5)).build();
-                HttpResponse<java.io.InputStream> resp = http.send(r, HttpResponse.BodyHandlers.ofInputStream());
-                try (java.io.InputStream in = resp.body()) {
-                    if (resp.statusCode() != 200) throw new IOException("HTTP " + resp.statusCode() + " — " + url);
-                    try (java.io.OutputStream out = Files.newOutputStream(tmp)) {
-                        byte[] buf = new byte[65536];
-                        int n;
-                        while ((n = in.read(buf)) > 0) {
-                            if (cancel.getAsBoolean()) throw new Cancelled();
-                            waitPause(cancel);
-                            out.write(buf, 0, n);
+                // Різні мережеві стеки по черзі: HTTP/1.1, HTTP/2 і, зрештою, класичний HttpURLConnection —
+                // якщо з'єднання рве антивірус, VPN чи роутер («IOException: closed», «Tag mismatch»).
+                if (t == 4) {
+                    java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                    c.setRequestProperty("User-Agent", "PaxLauncher/1.0");
+                    c.setConnectTimeout(20_000);
+                    c.setReadTimeout(60_000);
+                    c.setInstanceFollowRedirects(true);
+                    try {
+                        if (c.getResponseCode() != 200) throw new IOException("HTTP " + c.getResponseCode() + " — " + url);
+                        try (java.io.InputStream in = c.getInputStream(); java.io.OutputStream out = Files.newOutputStream(tmp)) {
+                            byte[] buf = new byte[65536];
+                            int n;
+                            while ((n = in.read(buf)) > 0) {
+                                if (cancel.getAsBoolean()) throw new Cancelled();
+                                waitPause(cancel);
+                                out.write(buf, 0, n);
+                            }
+                        }
+                    } finally { c.disconnect(); }
+                } else {
+                    HttpRequest r = HttpRequest.newBuilder(URI.create(url))
+                            .header("User-Agent", "PaxLauncher/1.0").timeout(Duration.ofMinutes(5)).build();
+                    HttpResponse<java.io.InputStream> resp = (t < 2 ? http : web).send(r, HttpResponse.BodyHandlers.ofInputStream());
+                    try (java.io.InputStream in = resp.body()) {
+                        if (resp.statusCode() != 200) throw new IOException("HTTP " + resp.statusCode() + " — " + url);
+                        try (java.io.OutputStream out = Files.newOutputStream(tmp)) {
+                            byte[] buf = new byte[65536];
+                            int n;
+                            while ((n = in.read(buf)) > 0) {
+                                if (cancel.getAsBoolean()) throw new Cancelled();
+                                waitPause(cancel);
+                                out.write(buf, 0, n);
+                            }
                         }
                     }
                 }
@@ -464,14 +509,6 @@ final class Engine {
         return merge(loadVersion(parent), v);
     }
 
-    private String libKey(Map<String, Object> lib) {
-        String name = s(lib.get("name"));
-        if (name == null) return null;
-        String[] pr = name.split(":");
-        if (pr.length < 2) return null;
-        return pr[0] + ":" + pr[1] + (pr.length > 3 ? ":" + pr[3] : "");
-    }
-
     private Map<String, Object> merge(Map<String, Object> p, Map<String, Object> c) {
         Map<String, Object> r = new LinkedHashMap<>(p);
         for (var e : c.entrySet()) {
@@ -479,23 +516,20 @@ final class Engine {
             if (k.equals("arguments") || k.equals("libraries")) continue;
             r.put(k, e.getValue());
         }
-        // Бібліотеки батьківської версії (Vanilla) лишаємо як є — саме з таким списком Vanilla запускається.
-        // Прибираємо лише ті, що Fabric/Forge перевизначає своїми (той самий group:artifact[:classifier]).
-        Set<String> childKeys = new HashSet<>();
-        List<Object> all = new ArrayList<>();
-        for (Object o : l(c.get("libraries"))) {
-            String k = libKey(m(o));
-            if (k != null && !childKeys.add(k)) continue;
-            all.add(o);
-        }
-        for (Object o : l(p.get("libraries"))) {
-            String k = libKey(m(o));
-            if (k != null && childKeys.contains(k)) continue;
-            all.add(o);
-        }
+        List<Object> all = new ArrayList<>(l(c.get("libraries")));
+        all.addAll(l(p.get("libraries")));
         Map<String, Object> uniq = new LinkedHashMap<>();
         int n = 0;
-        for (Object o : all) uniq.put("#" + (n++), o);
+        for (Object o : all) {
+            String name = s(m(o).get("name"));
+            String key;
+            if (name == null) key = "#" + (n++);
+            else {
+                String[] pr = name.split(":");
+                key = pr[0] + ":" + pr[1] + (pr.length > 3 ? ":" + pr[3] : "");
+            }
+            uniq.putIfAbsent(key, o);
+        }
         r.put("libraries", new ArrayList<>(uniq.values()));
         Map<String, Object> pa = m(p.get("arguments")), ca = m(c.get("arguments"));
         if (pa != null || ca != null) {
@@ -674,17 +708,36 @@ final class Engine {
             try { Object nv = g(v, "javaVersion", "majorVersion"); if (nv instanceof Number) need = ((Number) nv).intValue(); } catch (Exception ignored) { }
             java = autoJava(need);
         }
-        Process pr = new ProcessBuilder(java, "-jar", inst.toString(), "--installClient", root.toString())
-                .directory(root.toFile()).redirectErrorStream(true).start();
-        proc = pr;
-        if (stop) pr.destroy();
-        try (BufferedReader r = new BufferedReader(new InputStreamReader(pr.getInputStream(), StandardCharsets.UTF_8))) {
-            String ln;
-            while ((ln = r.readLine()) != null) log.accept(ln);
+        int code = -1;
+        for (int attempt = 0; attempt < 4; attempt++) {
+            List<String> cmd = new ArrayList<>();
+            cmd.add(java);
+            // Після збою TLS (наприклад «Tag mismatch» через антивірус/VPN/нестабільне з'єднання) пробуємо TLS 1.2 та IPv4
+            if (attempt > 0) {
+                cmd.add("-Djdk.tls.client.protocols=TLSv1.2");
+                cmd.add("-Djava.net.preferIPv4Stack=true");
+            }
+            cmd.add("-jar"); cmd.add(inst.toString()); cmd.add("--installClient"); cmd.add(root.toString());
+            Process pr = new ProcessBuilder(cmd).directory(root.toFile()).redirectErrorStream(true).start();
+            proc = pr;
+            if (stop) pr.destroy();
+            boolean netErr = false;
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(pr.getInputStream(), StandardCharsets.UTF_8))) {
+                String ln;
+                while ((ln = r.readLine()) != null) {
+                    log.accept(ln);
+                    if (ln.contains("SSLException") || ln.contains("Tag mismatch") || ln.contains("Connection reset")
+                            || ln.contains("Read timed out") || ln.contains("Premature EOF") || ln.contains("SocketException")) netErr = true;
+                }
+            }
+            code = pr.waitFor();
+            proc = null;
+            if (stop) throw new Cancelled();
+            if (code == 0 || !netErr || attempt == 3) break;
+            log.accept("Помилка мережі під час встановлення, повторна спроба " + (attempt + 2) + "/4…");
+            pg.update(I18n.t("Встановлення ") + loader + " (" + (attempt + 2) + "/4)…", 0.45);
+            try { Thread.sleep(2000L * (attempt + 1)); } catch (InterruptedException ie) { throw new Cancelled(); }
         }
-        int code = pr.waitFor();
-        proc = null;
-        if (stop) throw new Cancelled();
         if (code != 0) throw new IOException(I18n.t("Встановлювач завершився з помилкою (код ") + code + I18n.t("). Деталі дивись у Консолі."));
         pg.update(I18n.t("Готово"), 1);
 
@@ -880,9 +933,6 @@ final class Engine {
                 String url = s(art.get("url"));
                 if (url != null && !url.isEmpty()) tasks.add(new Task(url, f, s(art.get("sha1"))));
                 cp.add(f);
-                String lname = s(lib.get("name"));
-                String[] lp = lname == null ? new String[0] : lname.split(":");
-                if (lp.length > 3 && lp[3].startsWith("natives-") && !nativeJars.contains(f)) nativeJars.add(f);
             } else if (lib.get("downloads") == null && s(lib.get("name")) != null) {
                 String path = mavenPath(s(lib.get("name")));
                 String base = s(lib.get("url"));
@@ -997,6 +1047,16 @@ final class Engine {
         List<String> cmd = new ArrayList<>();
         cmd.add(javaExe);
         int ram = cfg.geti("ram", 4096);
+        // власна ОЗП збірки (profile.properties у папці збірки) має пріоритет над загальною
+        try {
+            Path ppf = gameDir.resolve("profile.properties");
+            if (Files.isRegularFile(ppf)) {
+                Properties ppr = new Properties();
+                try (Reader prd = Files.newBufferedReader(ppf, StandardCharsets.UTF_8)) { ppr.load(prd); }
+                int pr = Integer.parseInt(ppr.getProperty("ram", "0").trim());
+                if (pr >= 512) ram = pr;
+            }
+        } catch (Exception ignored) { }
         cmd.add("-Xmx" + ram + "M");
         cmd.add("-Xms" + Math.min(ram, 1024) + "M");
         if (acc.type().equals("ely")) {
@@ -1014,6 +1074,11 @@ final class Engine {
                 String a = jv.get(ji);
                 if (valueNext) { valueNext = false; cmd.add(a); continue; }
                 if (jvmArgAllowed(a)) {
+                    // Forge/NeoForge: у -DignoreList стоїть ${version_name}.jar, але клієнтський jar лежить під ім'ям
+                    // батьківської версії (1.20.1.jar). Без цього ванільний jar потрапляє у модульний шлях і
+                    // викликає «Modules minecraft and _1._20._1 export package …».
+                    if (a.startsWith("-DignoreList=") && !jar.equals(id) && !(a.endsWith(jar + ".jar") || a.contains("," + jar + ".jar,")))
+                        a = a + "," + jar + ".jar";
                     cmd.add(a);
                     valueNext = TAKES_VALUE.contains(a);
                     continue;

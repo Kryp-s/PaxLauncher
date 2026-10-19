@@ -608,6 +608,15 @@ final class Theme {
                 g.draw(mt);
                 break;
             }
+            case 7: {
+                // стопка збірок: три книги-корінці
+                g.drawRoundRect(-10, -9, 6, 18, 2, 2);
+                g.drawRoundRect(-3, -9, 6, 18, 2, 2);
+                g.drawLine(5, 8, 11, -6);
+                g.drawLine(5, 8, 5, -7);
+                g.drawLine(11, -6, 5, -9);
+                break;
+            }
             default: {
                 Path2D.Float f = new Path2D.Float();
                 f.moveTo(-10, -5); f.lineTo(-10, -8); f.lineTo(-3, -8); f.lineTo(-1, -5); f.lineTo(10, -5);

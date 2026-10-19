@@ -61,5 +61,20 @@ final class Field extends JTextField {
         }
         g.dispose();
         super.paintComponent(g0);
+        if (hint != null && !hint.isEmpty() && getText().isEmpty()) {
+            Graphics2D h = (Graphics2D) g0.create();
+            Theme.aa(h);
+            h.setFont(getFont());
+            h.setColor(Theme.MUTED);
+            Insets in = getInsets();
+            FontMetrics fm = h.getFontMetrics();
+            h.drawString(hint, in.left, (getHeight() - fm.getHeight()) / 2 + fm.getAscent());
+            h.dispose();
+        }
     }
+
+    private String hint;
+
+    /** Сірий підпис у порожньому полі (наприклад, «Пошук…»). */
+    void setHint(String hint) { this.hint = hint; repaint(); }
 }

@@ -41,6 +41,11 @@ final class Dlg {
     }
 
     static boolean show(Component parent, String title, JComponent content, String ok, String cancel, Consumer<JDialog> ready) {
+        return show(parent, title, content, ok, cancel, ready, null);
+    }
+
+    /** okHook отримує кнопку підтвердження ще до показу діалогу — її можна вимикати, поки дані не готові. */
+    static boolean show(Component parent, String title, JComponent content, String ok, String cancel, Consumer<JDialog> ready, Consumer<Btn> okHook) {
         Window owner = parent instanceof Window ? (Window) parent : parent == null ? null : SwingUtilities.getWindowAncestor(parent);
         JDialog d = new JDialog(owner, title, Dialog.ModalityType.APPLICATION_MODAL);
         d.setUndecorated(true);
@@ -69,6 +74,7 @@ final class Dlg {
         }
         bp.add(okB);
         root.add(bp, BorderLayout.SOUTH);
+        if (okHook != null) okHook.accept(okB);
 
         Point[] start = new Point[1];
         root.addMouseListener(new MouseAdapter() {

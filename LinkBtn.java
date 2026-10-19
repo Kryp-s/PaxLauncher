@@ -51,9 +51,36 @@ final class LinkBtn extends JButton {
         });
     }
 
+    /** Логотип Discord (22 x 15,3), масштабований під слот 20 x 18. */
+    private static java.awt.geom.Area discord() {
+        Path2D.Float p = new Path2D.Float();
+        p.moveTo(4.6f, 1.4f);
+        p.curveTo(6.0f, 0.8f, 7.4f, 0.4f, 8.2f, 0.3f);
+        p.lineTo(8.7f, 1.2f);
+        p.curveTo(10.2f, 1.0f, 11.8f, 1.0f, 13.3f, 1.2f);
+        p.lineTo(13.8f, 0.3f);
+        p.curveTo(14.6f, 0.4f, 16.0f, 0.8f, 17.4f, 1.4f);
+        p.curveTo(19.4f, 4.4f, 20.6f, 8.2f, 20.4f, 12.6f);
+        p.curveTo(18.9f, 13.8f, 17.2f, 14.6f, 15.4f, 15.0f);
+        p.lineTo(14.4f, 13.4f);
+        p.curveTo(13.4f, 13.7f, 12.2f, 13.9f, 11f, 13.9f);
+        p.curveTo(9.8f, 13.9f, 8.6f, 13.7f, 7.6f, 13.4f);
+        p.lineTo(6.6f, 15.0f);
+        p.curveTo(4.8f, 14.6f, 3.1f, 13.8f, 1.6f, 12.6f);
+        p.curveTo(1.4f, 8.2f, 2.6f, 4.4f, 4.6f, 1.4f);
+        p.closePath();
+        java.awt.geom.Area a = new java.awt.geom.Area(p);
+        a.subtract(new java.awt.geom.Area(new java.awt.geom.Ellipse2D.Float(6.8f, 6.6f, 3.0f, 3.6f)));
+        a.subtract(new java.awt.geom.Area(new java.awt.geom.Ellipse2D.Float(12.2f, 6.6f, 3.0f, 3.6f)));
+        a.transform(java.awt.geom.AffineTransform.getTranslateInstance(-1.4, -0.3));
+        a.transform(java.awt.geom.AffineTransform.getScaleInstance(20 / 19.0, 20 / 19.0));
+        a.transform(java.awt.geom.AffineTransform.getTranslateInstance(0, 1.3));
+        return a;
+    }
+
     @Override public Dimension getPreferredSize() {
         FontMetrics fm = getFontMetrics(getFont());
-        return new Dimension(14 + 20 + 8 + fm.stringWidth(getText()) + 14, 34);
+        return new Dimension(10 + 20 + 6 + fm.stringWidth(getText()) + 10, 34);
     }
 
     @Override protected void paintComponent(Graphics g0) {
@@ -68,13 +95,14 @@ final class LinkBtn extends JButton {
         }
         Color c = Fx.mix(Theme.ICON, Theme.ICON_HI, hv);
         g.setColor(c);
-        g.translate(14, (h - 18) / 2);
+        g.translate(10, (h - 18) / 2);
         if (icon == 0) {
-            java.awt.geom.Area a = new java.awt.geom.Area(new RoundRectangle2D.Float(0, 1.5f, 20, 14, 9, 9));
-            a.add(new java.awt.geom.Area(new RoundRectangle2D.Float(3, 12, 14, 5.5f, 4, 4)));
-            a.subtract(new java.awt.geom.Area(new java.awt.geom.Ellipse2D.Float(4.2f, 6.2f, 4f, 5f)));
-            a.subtract(new java.awt.geom.Area(new java.awt.geom.Ellipse2D.Float(11.8f, 6.2f, 4f, 5f)));
-            g.fill(a);
+            g.fill(discord());
+        } else if (icon == 2) {
+            g.setStroke(new BasicStroke(1.7f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            g.draw(new java.awt.geom.Ellipse2D.Float(1.5f, 0.6f, 17f, 17f));
+            g.draw(new java.awt.geom.Ellipse2D.Float(6f, 0.6f, 8f, 17f));
+            g.draw(new java.awt.geom.Line2D.Float(1.5f, 9.1f, 18.5f, 9.1f));
         } else {
             Path2D.Float hp = new Path2D.Float();
             hp.moveTo(10, 17.5f);
@@ -83,10 +111,10 @@ final class LinkBtn extends JButton {
             hp.closePath();
             g.fill(hp);
         }
-        g.translate(-14, -(h - 18) / 2);
+        g.translate(-10, -(h - 18) / 2);
         g.setFont(getFont());
         FontMetrics fm = g.getFontMetrics();
-        g.drawString(getText(), 14 + 20 + 8, (h - fm.getHeight()) / 2 + fm.getAscent());
+        g.drawString(getText(), 10 + 20 + 6, (h - fm.getHeight()) / 2 + fm.getAscent());
         g.dispose();
     }
 }

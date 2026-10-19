@@ -33,8 +33,15 @@ import javax.swing.plaf.basic.*;
 final class ImgIcon implements Icon {
     private final BufferedImage img;
     private final int size;
+    private final boolean dflt;
+
+    /** Іконка за замовчуванням (куб) для файлів без власної іконки. */
+    static ImgIcon fallback(int size) { return new ImgIcon(size); }
+
+    private ImgIcon(int size) { this.size = size; this.img = null; this.dflt = true; }
 
     ImgIcon(BufferedImage img, int size) {
+        this.dflt = false;
         this.size = size;
         this.img = img == null ? null : render(img, size * 2);
     }
@@ -96,6 +103,17 @@ final class ImgIcon implements Icon {
             g.fillRoundRect(x, y, size, size, size / 4, size / 4);
             g.setColor(Theme.ov(30));
             g.drawRoundRect(x, y, size - 1, size - 1, size / 4, size / 4);
+            if (dflt) {
+                float u = size / 40f, cx = x + size / 2f, cy = y + size / 2f;
+                g.setColor(Theme.ov(70));
+                g.setStroke(new BasicStroke(Math.max(1.4f, 1.8f * u), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                java.awt.geom.Path2D.Float cube = new java.awt.geom.Path2D.Float();
+                cube.moveTo(cx, cy - 11 * u); cube.lineTo(cx + 10 * u, cy - 5.5f * u); cube.lineTo(cx + 10 * u, cy + 5.5f * u);
+                cube.lineTo(cx, cy + 11 * u); cube.lineTo(cx - 10 * u, cy + 5.5f * u); cube.lineTo(cx - 10 * u, cy - 5.5f * u); cube.closePath();
+                cube.moveTo(cx - 10 * u, cy - 5.5f * u); cube.lineTo(cx, cy); cube.lineTo(cx + 10 * u, cy - 5.5f * u);
+                cube.moveTo(cx, cy); cube.lineTo(cx, cy + 11 * u);
+                g.draw(cube);
+            }
         } else {
             g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
             g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);

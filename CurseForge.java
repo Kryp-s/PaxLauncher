@@ -96,7 +96,7 @@ final class CurseForge {
                         .header("User-Agent", "PaxLauncher/1.0").timeout(Duration.ofSeconds(30));
                 if (postBody != null) b.header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(postBody));
                 else b.GET();
-                HttpResponse<String> r = eng.http.send(b.build(), HttpResponse.BodyHandlers.ofString());
+                HttpResponse<String> r = eng.sendRetry(b.build(), HttpResponse.BodyHandlers.ofString());
                 int sc = r.statusCode();
                 if (sc == 429) { Thread.sleep(1500L * (attempt + 1)); continue; }
                 if (sc == 401 || sc == 403) throw new IOException(I18n.t("CurseForge не прийняв ключ API (HTTP ") + sc + ")");
@@ -153,7 +153,8 @@ final class CurseForge {
 
     List<ModApi.Hit> search(ModApi.Kind kind, String q, String mc, String loader, int offset) throws IOException {
         StringBuilder u = new StringBuilder("/mods/search?gameId=" + GAME_MINECRAFT + "&classId=" + kind.cfClass
-                + "&pageSize=" + ModApi.PAGE + "&index=" + offset + "&sortOrder=desc&gameVersion=" + enc(mc));
+                + "&pageSize=" + ModApi.PAGE + "&index=" + offset + "&sortOrder=desc");
+        if (!kind.isPack()) u.append("&gameVersion=").append(enc(mc));
         if (kind.isMod()) {
             int lt = loaderType(loader);
             if (lt > 0) u.append("&modLoaderType=").append(lt);
@@ -239,7 +240,8 @@ final class CurseForge {
 
     List<ModApi.ModFile> files(ModApi.Kind kind, String id, String mc, String loader) throws IOException {
         String n = numId(id);
-        StringBuilder u = new StringBuilder("/mods/" + n + "/files?pageSize=50&gameVersion=" + enc(mc));
+        StringBuilder u = new StringBuilder("/mods/" + n + "/files?pageSize=50");
+        if (!kind.isPack()) u.append("&gameVersion=").append(enc(mc));
         if (kind.isMod()) {
             int lt = loaderType(loader);
             if (lt > 0) u.append("&modLoaderType=").append(lt);
@@ -252,6 +254,7 @@ final class CurseForge {
             if (f == null) continue;
             String fn = str(f.get("fileName"));
             if (fn.isEmpty()) continue;
+            if (kind.isPack() && !fn.toLowerCase(Locale.ROOT).endsWith(".zip")) continue;
             String url = Json.string(f.get("downloadUrl"));
             if (url != null && url.isBlank()) url = null;
             String sha1 = null;
@@ -268,8 +271,19 @@ final class CurseForge {
                 if (dm != null && num(dm.get("relationType")) == 3 && num(dm.get("modId")) > 0) deps.add("cf:" + num(dm.get("modId")));
             }
             String name = str(f.get("displayName"));
+            List<String> packMcs = new ArrayList<>(), packLds = new ArrayList<>();
+            if (kind.isPack()) {
+                String mcv = "";
+                List<String> ld = new ArrayList<>();
+                for (Object gv : l(f.get("gameVersions"))) {
+                    String g = str(gv);
+                    if (g.matches("\\d+\\.\\d+(\\.\\d+)?")) { if (mcv.isEmpty()) mcv = g; packMcs.add(g); }
+                    else if (g.equals("Forge") || g.equals("Fabric") || g.equals("NeoForge") || g.equals("Quilt")) { ld.add(g); packLds.add(g.toLowerCase(Locale.ROOT)); }
+                }
+                name = (name.isEmpty() ? fn : name) + (mcv.isEmpty() && ld.isEmpty() ? "" : "  · " + mcv + (ld.isEmpty() ? "" : " " + String.join("/", ld)));
+            }
             out.add(new ModApi.ModFile(name.isEmpty() ? fn : name, fn, url, sha1, channel,
-                    date.length() >= 10 ? date.substring(0, 10) : "", deps));
+                    date.length() >= 10 ? date.substring(0, 10) : "", deps, packMcs, packLds));
         }
         out.sort((a, b) -> b.date().compareTo(a.date()));
         return out;
@@ -320,5 +334,90 @@ final class CurseForge {
         if (ex.isEmpty() || m(ex.get(0)) == null) return null;
         long id = num(m(ex.get(0)).get("id"));
         return id > 0 ? "cf:" + id : null;
+    }
+
+    // ---------- модові збірки (modpacks) ----------
+
+    record FileInfo(long fileId, long modId, String filename, String url, String sha1) { }
+
+    record ModMeta(long id, String name, String slug, int classId) { }
+
+    Map<Long, FileInfo> filesById(Collection<Long> ids) throws IOException {
+        Map<Long, FileInfo> out = new HashMap<>();
+        List<Long> all = new ArrayList<>(new LinkedHashSet<>(ids));
+        for (int i = 0; i < all.size(); i += 50) {
+            List<Long> part = all.subList(i, Math.min(all.size(), i + 50));
+            StringBuilder b = new StringBuilder("{\"fileIds\":[");
+            for (int k = 0; k < part.size(); k++) b.append(k > 0 ? "," : "").append(part.get(k));
+            b.append("]}");
+            Map<String, Object> root = m(Json.parse(call("/mods/files", b.toString())));
+            if (root == null) continue;
+            for (Object o : l(root.get("data"))) {
+                Map<String, Object> f = m(o);
+                if (f == null || num(f.get("id")) <= 0) continue;
+                String url = Json.string(f.get("downloadUrl"));
+                if (url != null && url.isBlank()) url = null;
+                String sha1 = null;
+                for (Object ho : l(f.get("hashes"))) {
+                    Map<String, Object> hm = m(ho);
+                    if (hm != null && num(hm.get("algo")) == 1 && str(hm.get("value")).matches("[0-9a-fA-F]{40}")) sha1 = str(hm.get("value"));
+                }
+                out.put(num(f.get("id")), new FileInfo(num(f.get("id")), num(f.get("modId")), str(f.get("fileName")), url, sha1));
+            }
+        }
+        return out;
+    }
+
+    /** Один файл за id (коли пакетний запит його не повернув). */
+    FileInfo fileOne(long modId, long fileId) {
+        try {
+            Map<String, Object> root = m(Json.parse(call("/mods/" + modId + "/files/" + fileId, null)));
+            Map<String, Object> f = root == null ? null : m(root.get("data"));
+            if (f == null || num(f.get("id")) <= 0) return null;
+            String url = Json.string(f.get("downloadUrl"));
+            if (url != null && url.isBlank()) url = null;
+            String sha1 = null;
+            for (Object ho : l(f.get("hashes"))) {
+                Map<String, Object> hm = m(ho);
+                if (hm != null && num(hm.get("algo")) == 1 && str(hm.get("value")).matches("[0-9a-fA-F]{40}")) sha1 = str(hm.get("value"));
+            }
+            return new FileInfo(num(f.get("id")), modId, str(f.get("fileName")), url, sha1);
+        } catch (Exception e) { return null; }
+    }
+
+    /** Посилання на завантаження через окремий запит API (інколи є, коли в списку downloadUrl порожній). */
+    String apiDownloadUrl(long modId, long fileId) {
+        try {
+            Map<String, Object> root = m(Json.parse(call("/mods/" + modId + "/files/" + fileId + "/download-url", null)));
+            String u = root == null ? null : Json.string(root.get("data"));
+            return u == null || u.isBlank() ? null : u;
+        } catch (Exception e) { return null; }
+    }
+
+    /** Прямі адреси CDN CurseForge: потрібні для модів, автори яких вимкнули «завантаження сторонніми запускачами»
+     *  (тоді API не віддає downloadUrl, але файл за цією адресою лежить так само, як і для сайту). */
+    static List<String> cdnUrls(long fileId, String filename) {
+        String fn = URLEncoder.encode(filename, StandardCharsets.UTF_8).replace("+", "%20");
+        String tail = (fileId / 1000) + "/" + (fileId % 1000) + "/" + fn;
+        return List.of("https://edge.forgecdn.net/files/" + tail, "https://mediafilez.forgecdn.net/files/" + tail);
+    }
+
+    Map<Long, ModMeta> modMeta(Collection<Long> ids) throws IOException {
+        Map<Long, ModMeta> out = new HashMap<>();
+        List<Long> all = new ArrayList<>(new LinkedHashSet<>(ids));
+        for (int i = 0; i < all.size(); i += 50) {
+            List<Long> part = all.subList(i, Math.min(all.size(), i + 50));
+            StringBuilder b = new StringBuilder("{\"modIds\":[");
+            for (int k = 0; k < part.size(); k++) b.append(k > 0 ? "," : "").append(part.get(k));
+            b.append("]}");
+            Map<String, Object> root = m(Json.parse(call("/mods", b.toString())));
+            if (root == null) continue;
+            for (Object o : l(root.get("data"))) {
+                Map<String, Object> h = m(o);
+                if (h == null || num(h.get("id")) <= 0) continue;
+                out.put(num(h.get("id")), new ModMeta(num(h.get("id")), str(h.get("name")), str(h.get("slug")), (int) num(h.get("classId"))));
+            }
+        }
+        return out;
     }
 }
