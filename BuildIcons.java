@@ -15,11 +15,7 @@ final class BuildIcons {
     private BuildIcons() { }
 
     static final String CUSTOM = "custom";
-    static final String[] IDS = {
-            "cube", "pickaxe", "sword", "shield", "heart", "star", "bolt", "flame", "tree", "gem", "crown",
-            "skull", "ghost", "rocket", "planet", "moon", "sun", "cloud", "snow", "anvil", "potion", "compass",
-            "map", "key", "fish", "paw", "trophy", "gear", "book", "house", "pixel", "target", "note", "wave",
-            "mountain", "tower", "clover", "robot", "hammer", "torch", "eye", "anchor"};
+    static final String[] IDS = BlockTex.NAMES;
 
     static boolean valid(String id) { return Arrays.asList(IDS).contains(id); }
 
@@ -48,22 +44,31 @@ final class BuildIcons {
         g.draw(new RoundRectangle2D.Float(0.5f, 0.5f, s - 1f, s - 1f, s * 0.46f, s * 0.46f));
     }
 
-    /** Малює вбудовану іконку у квадрат s×s з верхнім лівим кутом (x, y). */
+    private static final Map<String, BufferedImage> PAINT_CACHE = new HashMap<>();
+
+    private static synchronized BufferedImage tileImage(String id, int s) {
+        String key = id + "@" + s;
+        BufferedImage c = PAINT_CACHE.get(key);
+        if (c != null) return c;
+        BufferedImage tex = BlockTex.get(id);
+        BufferedImage img = new BufferedImage(s, s, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D ig = img.createGraphics();
+        ig.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+        ig.drawImage(tex, 0, 0, s, s, null);
+        ig.setComposite(AlphaComposite.DstIn);
+        ig.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        ig.setColor(Color.WHITE);
+        float arc = s * 0.30f;
+        ig.fill(new RoundRectangle2D.Float(0, 0, s, s, arc, arc));
+        ig.dispose();
+        PAINT_CACHE.put(key, img);
+        return img;
+    }
+
+    /** Малює вбудовану іконку (текстуру блоку) у квадрат s×s з верхнім лівим кутом (x, y). */
     static void paint(Graphics2D g0, String id, int x, int y, int s) {
-        int idx = Math.max(0, Arrays.asList(IDS).indexOf(id));
-        Graphics2D g = (Graphics2D) g0.create();
-        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-        g.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE);
-        g.translate(x, y);
-        Color[] c = pair(idx);
-        tile(g, s, c[0], c[1]);
-        g.translate(s / 2.0, s / 2.0);
-        double k = s / 56.0;
-        g.scale(k, k);
-        g.setColor(Color.WHITE);
-        g.setStroke(new BasicStroke(3.2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-        glyph(g, id);
-        g.dispose();
+        if (s <= 0) return;
+        g0.drawImage(tileImage(valid(id) ? id : IDS[0], s), x, y, null);
     }
 
     private static final Color SH = new Color(0, 0, 0, 70);

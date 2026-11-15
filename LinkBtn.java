@@ -33,10 +33,29 @@ import javax.swing.plaf.basic.*;
 final class LinkBtn extends JButton {
     private final Fx fx = new Fx(this);
     private final int icon;
+    private final boolean iconOnly;
+
+    /** Кнопка лише з іконкою (без тексту); текст стає підказкою. */
+    LinkBtn(String tip, int icon, boolean iconOnly) {
+        this(iconOnly ? "" : tip, icon, iconOnly, tip);
+    }
 
     LinkBtn(String text, int icon) {
+        this(text, icon, false, null);
+    }
+
+    private LinkBtn(String text, int icon, boolean iconOnly, String tip) {
         super(text);
         this.icon = icon;
+        this.iconOnly = iconOnly;
+        if (iconOnly) {
+            setToolTipText(tip);
+            setAlignmentX(Component.CENTER_ALIGNMENT);
+            Dimension d = new Dimension(Theme.SIDE_W, 50);
+            setPreferredSize(d);
+            setMinimumSize(d);
+            setMaximumSize(d);
+        }
         setContentAreaFilled(false);
         setBorderPainted(false);
         setFocusPainted(false);
@@ -79,6 +98,7 @@ final class LinkBtn extends JButton {
     }
 
     @Override public Dimension getPreferredSize() {
+        if (iconOnly) return super.getPreferredSize();
         FontMetrics fm = getFontMetrics(getFont());
         return new Dimension(10 + 20 + 6 + fm.stringWidth(getText()) + 10, 34);
     }
@@ -86,6 +106,38 @@ final class LinkBtn extends JButton {
     @Override protected void paintComponent(Graphics g0) {
         Graphics2D g = (Graphics2D) g0.create();
         Theme.aa(g);
+        if (iconOnly) {
+            double k = Theme.S;
+            g.scale(k, k);
+            int iw = (int) Math.round(getWidth() / k), ih = (int) Math.round(getHeight() / k);
+            float ihv = fx.h();
+            Fx.squeeze(g, iw, ih, fx.p());
+            if (ihv > 0) {
+                g.setColor(Theme.ov(Math.round(16 * ihv + 8 * fx.p())));
+                g.fillRoundRect((iw - 46) / 2, (ih - 46) / 2, 46, 46, 20, 20);
+            }
+            g.setColor(Fx.mix(Theme.NAV_IDLE, Theme.TEXT, ihv));
+            g.translate(iw / 2.0, ih / 2.0);
+            g.scale(1.3, 1.3);
+            g.translate(-10, -9);
+            if (icon == 0) {
+                g.fill(discord());
+            } else if (icon == 2) {
+                g.setStroke(new BasicStroke(1.7f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                g.draw(new java.awt.geom.Ellipse2D.Float(1.5f, 0.6f, 17f, 17f));
+                g.draw(new java.awt.geom.Ellipse2D.Float(6f, 0.6f, 8f, 17f));
+                g.draw(new java.awt.geom.Line2D.Float(1.5f, 9.1f, 18.5f, 9.1f));
+            } else {
+                Path2D.Float hp = new Path2D.Float();
+                hp.moveTo(10, 17.5f);
+                hp.curveTo(-4, 8, 3, -1, 10, 4.5f);
+                hp.curveTo(17, -1, 24, 8, 10, 17.5f);
+                hp.closePath();
+                g.fill(hp);
+            }
+            g.dispose();
+            return;
+        }
         int w = getWidth(), h = getHeight();
         float hv = fx.h();
         Fx.squeeze(g, w, h, fx.p());

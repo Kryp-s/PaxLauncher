@@ -575,19 +575,29 @@ final class Theme {
                 break;
             }
             case 1: {
-                g.drawOval(-10, -10, 20, 20);
-                Path2D.Float d = new Path2D.Float();
-                d.moveTo(5, -5); d.lineTo(1.5f, 1.5f); d.lineTo(-5, 5); d.lineTo(-1.5f, -1.5f); d.closePath();
-                g.draw(d);
+                // сітка 2x2 (іконка модифікацій)
+                g.drawRoundRect(-10, -10, 8, 8, 3, 3);
+                g.drawRoundRect(2, -10, 8, 8, 3, 3);
+                g.drawRoundRect(-10, 2, 8, 8, 3, 3);
+                g.drawRoundRect(2, 2, 8, 8, 3, 3);
                 break;
             }
             case 2: {
-                g.drawOval(-6, -6, 12, 12);
-                g.drawOval(-2, -2, 4, 4);
+                // шестерня: 8 зубців + отвір
+                Path2D.Float gear = new Path2D.Float();
+                double rRoot = 7.2, rOut = 10.4;
+                double dIn = Math.toRadians(15), dOut = Math.toRadians(9.5);
                 for (int i = 0; i < 8; i++) {
                     double a = i * Math.PI / 4;
-                    g.draw(new java.awt.geom.Line2D.Double(Math.cos(a) * 6.5, Math.sin(a) * 6.5, Math.cos(a) * 10.5, Math.sin(a) * 10.5));
+                    double[][] pts = {{rRoot, a - dIn}, {rOut, a - dOut}, {rOut, a + dOut}, {rRoot, a + dIn}};
+                    for (int j = 0; j < 4; j++) {
+                        float x = (float) (Math.cos(pts[j][1]) * pts[j][0]), y = (float) (Math.sin(pts[j][1]) * pts[j][0]);
+                        if (i == 0 && j == 0) gear.moveTo(x, y); else gear.lineTo(x, y);
+                    }
                 }
+                gear.closePath();
+                g.draw(gear);
+                g.drawOval(-3, -3, 6, 6);
                 break;
             }
             case 3: {

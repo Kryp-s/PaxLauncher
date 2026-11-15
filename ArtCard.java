@@ -31,13 +31,14 @@ import javax.swing.border.*;
 import javax.swing.plaf.basic.*;
 
 final class ArtCard extends JComponent {
-    static final int H = 266, IMG_H = 150;
+    static final int H = 230, MIN_H = 160, IMG_MAX = 260, IMG_MIN = 40, TEXT_H = 118;
     private final int art;
     private final double focus;
     private final String title, desc;
     private final Fx fx = new Fx(this);
     private BufferedImage masked;
     private int maskW, maskH;
+    private BufferedImage shade, shadeSrc;
     private BufferedImage masked2;
     private int mask2W, mask2H;
 
@@ -56,7 +57,7 @@ final class ArtCard extends JComponent {
 
     @Override public Dimension getPreferredSize() { return new Dimension(Theme.px(300), Theme.px(H)); }
 
-    @Override public Dimension getMinimumSize() { return new Dimension(Theme.px(180), Theme.px(H)); }
+    @Override public Dimension getMinimumSize() { return new Dimension(Theme.px(180), Theme.px(MIN_H)); }
 
     static BufferedImage topRounded(BufferedImage im, int w, int h, double focus) { return topRounded(im, w, h, focus, 16); }
 
@@ -104,7 +105,13 @@ final class ArtCard extends JComponent {
         double k = Theme.S;
         int pw = getWidth(), ph = getHeight();
         if (pw <= 0) { g.dispose(); return; }
-        int imgPx = (int) Math.round(IMG_H * k);
+        int hLog = (int) Math.round(ph / k);
+        int wLog = (int) Math.round(pw / k);
+        FontMetrics fmT = g.getFontMetrics(Theme.fontRaw(Font.PLAIN, 13));
+        int nLines = wrap(desc, fmT, wLog - 32, 3).size();
+        int textH = 30 + 10 + fmT.getAscent() + (nLines - 1) * (fmT.getHeight() + 1) + fmT.getDescent() + 14;
+        int imgH = Math.max(IMG_MIN, Math.min(IMG_MAX, hLog - textH));
+        int imgPx = (int) Math.round(imgH * k);
         if (masked == null || maskW != pw || maskH != imgPx) {
             BufferedImage prev = masked;
             int pwid = maskW, phei = maskH;
@@ -120,8 +127,23 @@ final class ArtCard extends JComponent {
         int w = (int) Math.round(pw / k), h = (int) Math.round(ph / k);
         g.setColor(Theme.CARD);
         g.fillRoundRect(0, 0, w, h, 16, 16);
+        if (shade == null || shadeSrc != masked) {
+            shade = new BufferedImage(masked.getWidth(), masked.getHeight(), BufferedImage.TYPE_INT_ARGB);
+            Graphics2D sg = shade.createGraphics();
+            sg.drawImage(masked, 0, 0, null);
+            sg.setComposite(AlphaComposite.SrcAtop);
+            sg.setColor(new Color(0, 0, 0, 95));
+            sg.fillRect(0, 0, shade.getWidth(), shade.getHeight());
+            sg.dispose();
+            shadeSrc = masked;
+        }
         Graphics2D gi = (Graphics2D) g0.create();
         gi.drawImage(masked, 0, 0, null);
+        float dim = 1f - fx.h();
+        if (dim > 0f) {
+            gi.setComposite(AlphaComposite.SrcOver.derive(dim));
+            gi.drawImage(shade, 0, 0, null);
+        }
         gi.dispose();
         if (fx.h() > 0) {
             g.setColor(Theme.ov(Math.round(12 * fx.h())));
@@ -130,7 +152,7 @@ final class ArtCard extends JComponent {
             g.setStroke(new BasicStroke(1.6f));
             g.drawRoundRect(1, 1, w - 3, h - 3, 16, 16);
         }
-        int pad = 16, y = IMG_H + 30;
+        int pad = 16, y = imgH + 30;
         g.setFont(Theme.fontRaw(Font.BOLD, 16));
         g.setColor(Theme.TEXT);
         g.drawString(title, pad, y);
